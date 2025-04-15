@@ -4,34 +4,38 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
 
-def run_query_using_airflow_connection(conn_id: str, sql: str):
-    airflow_conn = BaseHook.get_connection(conn_id)
+def run_query(conn_id: str, sql: str):
+    conn_obj = BaseHook.get_connection(conn_id)
     conn_str = (
-        f"postgresql://{airflow_conn.login}:{airflow_conn.password}"
-        f"@{airflow_conn.host}:{airflow_conn.port}/{airflow_conn.schema}"
+        f"postgresql://{conn_obj.login}:{conn_obj.password}@"
+        f"{conn_obj.host}:{conn_obj.port}/{conn_obj.schema}"
     )
     with psycopg2.connect(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
+        conn.commit()
 
 def detect_changed_data(**kwargs):
+    # This example assumes there is an OLTP change log table.
     sql = """
     INSERT INTO staging_changed_data (RecordID, ChangeTime)
     SELECT RecordID, ChangeTime FROM OLTP_ChangeLog
     WHERE ChangeTime > (SELECT COALESCE(MAX(ProcessedTime), '2000-01-01') FROM staging_changed_data);
     """
-    run_query_using_airflow_connection(conn_id="b2b_sales", sql=sql)
+    # Using the OLTP connection (oltp_b2b_sales) for extraction
+    run_query("oltp_b2b_sales", sql)
 
 def update_dimensions_scd2(**kwargs):
+    # Example SCD Type 2 update for DimProduct in OLAP.
     sql = """
-    -- Close the current version if a change is detected (placeholder condition)
-    UPDATE DimProduct d
+    -- Close the current version if a change is detected.
+    UPDATE DimProduct
     SET ValidTo = CURRENT_DATE, IsCurrent = FALSE
-    WHERE d.ProductID IN (
+    WHERE ProductID IN (
         SELECT ProductID FROM staging_changed_data WHERE <change_condition>
-    ) AND d.IsCurrent = TRUE;
+    ) AND IsCurrent = TRUE;
     
-    -- Insert the new record version (placeholder condition)
+    -- Insert new version for the changed records.
     INSERT INTO DimProduct (ProductID, ProductName, SeriesName, Price, ValidFrom, ValidTo, IsCurrent)
     SELECT ProductID, ProductName, SeriesName, Price, CURRENT_DATE, NULL, TRUE
     FROM OLTP_Products
@@ -39,7 +43,7 @@ def update_dimensions_scd2(**kwargs):
         SELECT ProductID FROM staging_changed_data WHERE <new_or_changed_condition>
     );
     """
-    run_query_using_airflow_connection(conn_id="b2b_sales", sql=sql)
+    run_query("b2b_sales_olap", sql)
 
 def update_fact(**kwargs):
     sql = """
@@ -55,7 +59,7 @@ def update_fact(**kwargs):
     JOIN DimDealStage ds ON sp.DealStage = ds.StageName
     WHERE sp.RecordID IN (SELECT RecordID FROM staging_changed_data);
     """
-    run_query_using_airflow_connection(conn_id="b2b_sales", sql=sql)
+    run_query("b2b_sales_olap", sql)
 
 def update_aggregate(**kwargs):
     sql = """
@@ -84,13 +88,13 @@ def update_aggregate(**kwargs):
     WHERE sp.RecordID IN (SELECT RecordID FROM staging_changed_data)
     GROUP BY d.Year, d.Month, s.Region, ds.StageID;
     """
-    run_query_using_airflow_connection(conn_id="b2b_sales", sql=sql)
+    run_query("b2b_sales_olap", sql)
 
 def validate_incremental(**kwargs):
-    airflow_conn = BaseHook.get_connection("b2b_sales")
+    conn_obj = BaseHook.get_connection("b2b_sales_olap")
     conn_str = (
-        f"postgresql://{airflow_conn.login}:{airflow_conn.password}"
-        f"@{airflow_conn.host}:{airflow_conn.port}/{airflow_conn.schema}"
+        f"postgresql://{conn_obj.login}:{conn_obj.password}@"
+        f"{conn_obj.host}:{conn_obj.port}/{conn_obj.schema}"
     )
     with psycopg2.connect(conn_str) as conn:
         with conn.cursor() as cur:
@@ -105,20 +109,20 @@ default_args = {
     'owner': 'data_engineer',
     'depends_on_past': False,
     'retries': 2,
-    'retry_delay': timedelta(minutes=5),
-    'email_on_failure': False
+    'retry_delay': timedelta(minutes=5)
 }
 
 with DAG(
-    dag_id='dwh_incremental_load',
+    dag_id='dwh_incremental_update',
     default_args=default_args,
-    description='Incremental update for OLAP warehouse (SCD2 dimension updates and incremental fact/aggregate load) using connection id b2b_sales',
+    description='Incremental update from OLTP to OLAP (dimensions, fact, aggregate) with modifications',
     schedule_interval='@daily',
     start_date=datetime(2020, 1, 1),
-    catchup=False
+    catchup=False,
+    tags=['incremental', 'olap_update']
 ) as dag:
 
-    t_detect = PythonOperator(
+    t_detect_changed = PythonOperator(
         task_id='detect_changed_data',
         python_callable=detect_changed_data
     )
@@ -144,4 +148,4 @@ with DAG(
         provide_context=True
     )
 
-    t_detect >> t_update_dimensions >> t_update_fact >> t_update_aggregate >> t_validate
+    t_detect_changed >> t_update_dimensions >> t_update_fact >> t_update_aggregate >> t_validate

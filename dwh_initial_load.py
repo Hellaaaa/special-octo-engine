@@ -1,24 +1,32 @@
 from datetime import datetime, timedelta
-import psycopg2
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+import psycopg2
 from airflow.hooks.base import BaseHook
 
-def run_query_using_airflow_connection(conn_id: str, sql: str):
-    """Run a SQL query using psycopg2, retrieving credentials from the Airflow connection UI."""
-    # 1. Fetch the Connection object from Airflow
-    airflow_conn = BaseHook.get_connection(conn_id)
-    
-    # 2. Build the psycopg2 connection string from the retrieved credentials
+def run_query(conn_id: str, sql: str):
+    """
+    Retrieve connection details from Airflow using the provided connection id,
+    build a psycopg2 connection string, and execute the SQL command.
+    """
+    conn_obj = BaseHook.get_connection(conn_id)
     conn_str = (
-        f"postgresql://{airflow_conn.login}:{airflow_conn.password}"
-        f"@{airflow_conn.host}:{airflow_conn.port}/{airflow_conn.schema}"
+        f"postgresql://{conn_obj.login}:{conn_obj.password}@"
+        f"{conn_obj.host}:{conn_obj.port}/{conn_obj.schema}"
     )
-    
-    # 3. Connect and execute the query
+    # Connect and execute SQL
     with psycopg2.connect(conn_str) as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
+        conn.commit()
+
+default_args = {
+    'owner': 'data_engineer',
+    'depends_on_past': False,
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5),
+    'email_on_failure': False
+}
 
 def create_tables(**kwargs):
     sql = """
@@ -101,31 +109,32 @@ def create_tables(**kwargs):
         FOREIGN KEY (DealStageKey) REFERENCES DimDealStage(StageID)
     );
     """
-    run_query_using_airflow_connection(conn_id="b2b_sales", sql=sql)
+    run_query("b2b_sales_olap", sql)
 
 def load_dimensions(**kwargs):
-    # Placeholder: Replace with your extraction logic from OLTP source
+    # Example: Load accounts dimension from OLTP to OLAP
     sql = """
     INSERT INTO DimAccount (AccountID, AccountName, Sector, RevenueRange, ParentAccountID)
-    SELECT AccountID, AccountName, Sector, RevenueRange, ParentAccountID FROM OLTP_Accounts;
+    SELECT AccountID, AccountName, Sector, RevenueRange, ParentAccountID 
+    FROM public.accounts;  -- OLTP table (assumed to be available in the source)
     """
-    run_query_using_airflow_connection(conn_id="b2b_sales", sql=sql)
+    run_query("b2b_sales_olap", sql)
 
 def load_fact(**kwargs):
-    # Placeholder: Replace with your extraction and transformation logic
+    # Example: Load fact data from OLTP to OLAP
     sql = """
     INSERT INTO FactSalesPerformance 
        (DateKey, AccountKey, ProductKey, SalesAgentKey, DealStageKey, CloseValue, DurationDays, ExpectedSuccessRate)
     SELECT d.DateKey, a.AccountID, p.ProductID, s.SalesAgentID, ds.StageID,
            sp.CloseValue, sp.DurationDays, sp.ExpectedSuccessRate
-    FROM OLTP_SalesPipeline sp
-    JOIN DimDate d ON sp.Date = d.Date
-    JOIN DimAccount a ON sp.AccountID = a.AccountID
-    JOIN DimProduct p ON sp.ProductID = p.ProductID
-    JOIN DimSalesAgent s ON sp.SalesAgentID = s.SalesAgentID
-    JOIN DimDealStage ds ON sp.DealStage = ds.StageName;
+    FROM public.sales_pipeline sp  -- OLTP fact source
+    JOIN DimDate d ON sp.date = d.Date
+    JOIN DimAccount a ON sp.Account_id = a.AccountID
+    JOIN DimProduct p ON sp.product_id = p.ProductID
+    JOIN DimSalesAgent s ON sp.sales_agent_id = s.SalesAgentID
+    JOIN DimDealStage ds ON sp.deal_stage = ds.StageName;
     """
-    run_query_using_airflow_connection(conn_id="b2b_sales", sql=sql)
+    run_query("b2b_sales_olap", sql)
 
 def compute_aggregate(**kwargs):
     sql = """
@@ -134,25 +143,20 @@ def compute_aggregate(**kwargs):
     INSERT INTO FactSalesMonthlyAggregate
        (Year, Month, Region, DealStageKey, TotalDealCount, TotalCloseValue, AvgDealValue, AvgDurationDays, ExpectedSuccessRate)
     SELECT d.Year, d.Month, s.Region, ds.StageID,
-           COUNT(*),
-           SUM(sp.CloseValue),
-           AVG(sp.CloseValue),
-           AVG(sp.DurationDays),
-           AVG(sp.ExpectedSuccessRate)
+           COUNT(*), SUM(sp.CloseValue), AVG(sp.CloseValue), AVG(sp.DurationDays), AVG(sp.ExpectedSuccessRate)
     FROM FactSalesPerformance sp
     JOIN DimDate d ON sp.DateKey = d.DateKey
     JOIN DimSalesAgent s ON sp.SalesAgentKey = s.SalesAgentID
     JOIN DimDealStage ds ON sp.DealStageKey = ds.StageID
     GROUP BY d.Year, d.Month, s.Region, ds.StageID;
     """
-    run_query_using_airflow_connection(conn_id="b2b_sales", sql=sql)
+    run_query("b2b_sales_olap", sql)
 
 def validate_initial_load(**kwargs):
-    # Retrieve a record count as a simple validation
-    conn_obj = BaseHook.get_connection("b2b_sales")
+    conn_obj = BaseHook.get_connection("b2b_sales_olap")
     conn_str = (
-        f"postgresql://{conn_obj.login}:{conn_obj.password}"
-        f"@{conn_obj.host}:{conn_obj.port}/{conn_obj.schema}"
+        f"postgresql://{conn_obj.login}:{conn_obj.password}@"
+        f"{conn_obj.host}:{conn_obj.port}/{conn_obj.schema}"
     )
     with psycopg2.connect(conn_str) as conn:
         with conn.cursor() as cur:
@@ -163,21 +167,14 @@ def validate_initial_load(**kwargs):
             else:
                 print("Initial load validation passed.")
 
-default_args = {
-    'owner': 'data_engineer',
-    'depends_on_past': False,
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
-    'email_on_failure': False
-}
-
 with DAG(
     dag_id='dwh_initial_load',
     default_args=default_args,
-    description='Initial load into OLAP warehouse (dimensions, fact, aggregates) using connection id b2b_sales',
-    schedule_interval=None,
+    description='Initial load: Transfer data from OLTP to OLAP with modifications',
+    schedule_interval=None,   # Manual trigger
     start_date=datetime(2020, 1, 1),
-    catchup=False
+    catchup=False,
+    tags=['initial_load']
 ) as dag:
 
     t_create_tables = PythonOperator(
