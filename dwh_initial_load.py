@@ -1,20 +1,25 @@
 from datetime import datetime, timedelta
+import os
+import psycopg2
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.hooks.postgres_hook import PostgresHook
 
-default_args = {
-    'owner': 'data_engineer',
-    'depends_on_past': False,
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
-    'email_on_failure': False
-}
+# Utility function to run a SQL command using psycopg2
+def run_query(sql):
+    conn_str = os.getenv('OLAP_B2B_SALES_CONN')
+    if not conn_str:
+        raise ValueError("OLAP_B2B_SALES_CONN environment variable is not set")
+    conn = psycopg2.connect(conn_str)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+    finally:
+        conn.close()
 
 def create_tables(**kwargs):
-    hook = PostgresHook(postgres_conn_id='olap_b2b_sales')
     sql = """
-    -- Створення таблиці DimDate
+    -- Create DimDate table
     CREATE TABLE IF NOT EXISTS DimDate (
         DateKey INT PRIMARY KEY,
         Date DATE NOT NULL,
@@ -23,8 +28,8 @@ def create_tables(**kwargs):
         Quarter INT NOT NULL,
         Year INT NOT NULL
     );
-
-    -- Створення таблиці DimAccount
+    
+    -- Create DimAccount table
     CREATE TABLE IF NOT EXISTS DimAccount (
         AccountID INT PRIMARY KEY,
         AccountName VARCHAR(255) NOT NULL,
@@ -33,8 +38,8 @@ def create_tables(**kwargs):
         ParentAccountID INT,
         FOREIGN KEY (ParentAccountID) REFERENCES DimAccount(AccountID)
     );
-
-    -- Створення таблиці DimProduct (SCD Type 2)
+    
+    -- Create DimProduct table (SCD Type 2)
     CREATE TABLE IF NOT EXISTS DimProduct (
         ProductID INT PRIMARY KEY,
         ProductName VARCHAR(255) NOT NULL,
@@ -45,22 +50,22 @@ def create_tables(**kwargs):
         ValidTo DATE,
         IsCurrent BOOLEAN NOT NULL DEFAULT TRUE
     );
-
-    -- Створення таблиці DimSalesAgent
+    
+    -- Create DimSalesAgent table
     CREATE TABLE IF NOT EXISTS DimSalesAgent (
         SalesAgentID INT PRIMARY KEY,
         SalesAgentName VARCHAR(255) NOT NULL,
         ManagerName VARCHAR(255),
         Region VARCHAR(100)
     );
-
-    -- Створення таблиці DimDealStage
+    
+    -- Create DimDealStage table
     CREATE TABLE IF NOT EXISTS DimDealStage (
         StageID INT PRIMARY KEY,
         StageName VARCHAR(50) NOT NULL
     );
-
-    -- Створення таблиці FactSalesPerformance
+    
+    -- Create FactSalesPerformance table
     CREATE TABLE IF NOT EXISTS FactSalesPerformance (
         FactSalesPerformanceID SERIAL PRIMARY KEY,
         DateKey INT NOT NULL,
@@ -77,8 +82,8 @@ def create_tables(**kwargs):
         FOREIGN KEY (SalesAgentKey) REFERENCES DimSalesAgent(SalesAgentID),
         FOREIGN KEY (DealStageKey) REFERENCES DimDealStage(StageID)
     );
-
-    -- Створення таблиці FactSalesMonthlyAggregate
+    
+    -- Create FactSalesMonthlyAggregate table
     CREATE TABLE IF NOT EXISTS FactSalesMonthlyAggregate (
         AggregateID SERIAL PRIMARY KEY,
         Year INT NOT NULL,
@@ -93,24 +98,24 @@ def create_tables(**kwargs):
         FOREIGN KEY (DealStageKey) REFERENCES DimDealStage(StageID)
     );
     """
-    hook.run(sql)
+    run_query(sql)
 
 def load_dimensions(**kwargs):
-    hook = PostgresHook(postgres_conn_id='olap_b2b_sales')
-    # Приклад вставки даних у DimAccount; повторіть для інших вимірів
+    # Placeholder SQL to load dimensions from the OLTP source.
+    # Replace with your actual ETL logic.
     sql = """
     INSERT INTO DimAccount (AccountID, AccountName, Sector, RevenueRange, ParentAccountID)
-    SELECT AccountID, AccountName, Sector, RevenueRange, ParentAccountID
-    FROM OLTP_Accounts;
+    SELECT AccountID, AccountName, Sector, RevenueRange, ParentAccountID FROM OLTP_Accounts;
     """
-    hook.run(sql)
+    run_query(sql)
 
 def load_fact(**kwargs):
-    hook = PostgresHook(postgres_conn_id='olap_b2b_sales')
-    # Приклад завантаження даних у FactSalesPerformance
+    # Placeholder SQL to load data into FactSalesPerformance.
     sql = """
-    INSERT INTO FactSalesPerformance (DateKey, AccountKey, ProductKey, SalesAgentKey, DealStageKey, CloseValue, DurationDays, ExpectedSuccessRate)
-    SELECT d.DateKey, a.AccountID, p.ProductID, s.SalesAgentID, ds.StageID, sp.CloseValue, sp.DurationDays, sp.ExpectedSuccessRate
+    INSERT INTO FactSalesPerformance 
+       (DateKey, AccountKey, ProductKey, SalesAgentKey, DealStageKey, CloseValue, DurationDays, ExpectedSuccessRate)
+    SELECT d.DateKey, a.AccountID, p.ProductID, s.SalesAgentID, ds.StageID,
+           sp.CloseValue, sp.DurationDays, sp.ExpectedSuccessRate
     FROM OLTP_SalesPipeline sp
     JOIN DimDate d ON sp.Date = d.Date
     JOIN DimAccount a ON sp.AccountID = a.AccountID
@@ -118,13 +123,14 @@ def load_fact(**kwargs):
     JOIN DimSalesAgent s ON sp.SalesAgentID = s.SalesAgentID
     JOIN DimDealStage ds ON sp.DealStage = ds.StageName;
     """
-    hook.run(sql)
+    run_query(sql)
 
 def compute_aggregate(**kwargs):
-    hook = PostgresHook(postgres_conn_id='olap_b2b_sales')
     sql = """
     DELETE FROM FactSalesMonthlyAggregate;
-    INSERT INTO FactSalesMonthlyAggregate (Year, Month, Region, DealStageKey, TotalDealCount, TotalCloseValue, AvgDealValue, AvgDurationDays, ExpectedSuccessRate)
+    
+    INSERT INTO FactSalesMonthlyAggregate
+       (Year, Month, Region, DealStageKey, TotalDealCount, TotalCloseValue, AvgDealValue, AvgDurationDays, ExpectedSuccessRate)
     SELECT d.Year, d.Month, s.Region, ds.StageID,
            COUNT(*),
            SUM(sp.CloseValue),
@@ -137,21 +143,36 @@ def compute_aggregate(**kwargs):
     JOIN DimDealStage ds ON sp.DealStageKey = ds.StageID
     GROUP BY d.Year, d.Month, s.Region, ds.StageID;
     """
-    hook.run(sql)
+    run_query(sql)
 
 def validate_initial_load(**kwargs):
-    hook = PostgresHook(postgres_conn_id='olap_b2b_sales')
-    records = hook.get_records("SELECT COUNT(*) FROM FactSalesPerformance;")
-    if records and records[0][0] < 1:
-        raise ValueError("Initial load validation failed: FactSalesPerformance is empty.")
-    else:
-        print("Initial load validation passed.")
+    conn_str = os.getenv('OLAP_B2B_SALES_CONN')
+    conn = psycopg2.connect(conn_str)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM FactSalesPerformance;")
+                result = cur.fetchone()
+                if result[0] < 1:
+                    raise ValueError("Initial load validation failed: FactSalesPerformance is empty.")
+                else:
+                    print("Initial load validation passed.")
+    finally:
+        conn.close()
+
+default_args = {
+    'owner': 'data_engineer',
+    'depends_on_past': False,
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5),
+    'email_on_failure': False
+}
 
 with DAG(
     dag_id='dwh_initial_load',
     default_args=default_args,
-    description='Первинне завантаження даних у OLAP-сховище (виміри, факт, агрегати)',
-    schedule_interval=None,  # Запуск вручну
+    description='Initial load into OLAP data warehouse using psycopg2 directly.',
+    schedule_interval=None,
     start_date=datetime(2020, 1, 1),
     catchup=False
 ) as dag:

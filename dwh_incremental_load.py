@@ -1,52 +1,55 @@
 from datetime import datetime, timedelta
+import os
+import psycopg2
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.hooks.postgres_hook import PostgresHook
 
-default_args = {
-    'owner': 'data_engineer',
-    'depends_on_past': False,
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
-    'email_on_failure': False
-}
+def run_query(sql):
+    conn_str = os.getenv('OLAP_B2B_SALES_CONN')
+    if not conn_str:
+        raise ValueError("OLAP_B2B_SALES_CONN environment variable is not set")
+    conn = psycopg2.connect(conn_str)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+    finally:
+        conn.close()
 
 def detect_changed_data(**kwargs):
-    # Приклад: Витягуємо ID змінених/нових записів з OLTP
-    hook = PostgresHook(postgres_conn_id='oltp_postgres')
+    # Placeholder: Insert changed record identifiers into a staging table from OLTP source.
+    # For real implementation, you may extract data using other means.
     sql = """
-    -- Заповнення staging-таблиці змінених даних з OLTP
     INSERT INTO staging_changed_data (RecordID, ChangeTime)
     SELECT RecordID, ChangeTime FROM OLTP_ChangeLog
     WHERE ChangeTime > (SELECT COALESCE(MAX(ProcessedTime), '2000-01-01') FROM staging_changed_data);
     """
-    hook.run(sql)
+    run_query(sql)
 
 def update_dimensions_scd2(**kwargs):
-    hook = PostgresHook(postgres_conn_id='olap_b2b_sales')
+    # Example SCD2 logic for DimProduct. Extend this logic for other dimensions as needed.
     sql = """
-    -- Приклад SCD2 для DimProduct:
     UPDATE DimProduct d
     SET ValidTo = CURRENT_DATE, IsCurrent = FALSE
     WHERE d.ProductID IN (
-        SELECT ProductID FROM staging_changed_data WHERE <умова змін>
+        SELECT ProductID FROM staging_changed_data WHERE <change_condition>
     ) AND d.IsCurrent = TRUE;
 
     INSERT INTO DimProduct (ProductID, ProductName, SeriesName, Price, ValidFrom, ValidTo, IsCurrent)
     SELECT ProductID, ProductName, SeriesName, Price, CURRENT_DATE, NULL, TRUE
     FROM OLTP_Products
     WHERE ProductID IN (
-        SELECT ProductID FROM staging_changed_data WHERE <умова новизни або змін>
+        SELECT ProductID FROM staging_changed_data WHERE <new_or_changed_condition>
     );
-    -- Аналогічно виконайте оновлення для інших вимірів.
     """
-    hook.run(sql)
+    run_query(sql)
 
 def update_fact(**kwargs):
-    hook = PostgresHook(postgres_conn_id='olap_b2b_sales')
     sql = """
-    INSERT INTO FactSalesPerformance (DateKey, AccountKey, ProductKey, SalesAgentKey, DealStageKey, CloseValue, DurationDays, ExpectedSuccessRate)
-    SELECT d.DateKey, a.AccountID, p.ProductID, s.SalesAgentID, ds.StageID, sp.CloseValue, sp.DurationDays, sp.ExpectedSuccessRate
+    INSERT INTO FactSalesPerformance 
+       (DateKey, AccountKey, ProductKey, SalesAgentKey, DealStageKey, CloseValue, DurationDays, ExpectedSuccessRate)
+    SELECT d.DateKey, a.AccountID, p.ProductID, s.SalesAgentID, ds.StageID,
+           sp.CloseValue, sp.DurationDays, sp.ExpectedSuccessRate
     FROM OLTP_SalesPipeline sp
     JOIN DimDate d ON sp.Date = d.Date
     JOIN DimAccount a ON sp.AccountID = a.AccountID
@@ -55,10 +58,9 @@ def update_fact(**kwargs):
     JOIN DimDealStage ds ON sp.DealStage = ds.StageName
     WHERE sp.RecordID IN (SELECT RecordID FROM staging_changed_data);
     """
-    hook.run(sql)
+    run_query(sql)
 
 def update_aggregate(**kwargs):
-    hook = PostgresHook(postgres_conn_id='olap_b2b_sales')
     sql = """
     DELETE FROM FactSalesMonthlyAggregate
     WHERE (Year, Month, Region, DealStageKey) IN (
@@ -70,7 +72,8 @@ def update_aggregate(**kwargs):
        WHERE sp.RecordID IN (SELECT RecordID FROM staging_changed_data)
     );
 
-    INSERT INTO FactSalesMonthlyAggregate (Year, Month, Region, DealStageKey, TotalDealCount, TotalCloseValue, AvgDealValue, AvgDurationDays, ExpectedSuccessRate)
+    INSERT INTO FactSalesMonthlyAggregate 
+       (Year, Month, Region, DealStageKey, TotalDealCount, TotalCloseValue, AvgDealValue, AvgDurationDays, ExpectedSuccessRate)
     SELECT d.Year, d.Month, s.Region, ds.StageID,
            COUNT(*),
            SUM(sp.CloseValue),
@@ -84,26 +87,41 @@ def update_aggregate(**kwargs):
     WHERE sp.RecordID IN (SELECT RecordID FROM staging_changed_data)
     GROUP BY d.Year, d.Month, s.Region, ds.StageID;
     """
-    hook.run(sql)
+    run_query(sql)
 
 def validate_incremental(**kwargs):
-    hook = PostgresHook(postgres_conn_id='olap_b2b_sales')
-    result = hook.get_records("SELECT COUNT(*) FROM FactSalesPerformance;")
-    if result and result[0][0] < 1:
-        raise ValueError("Incremental load validation failed: FactSalesPerformance appears empty.")
-    else:
-        print("Incremental load validation passed.")
+    conn_str = os.getenv('OLAP_B2B_SALES_CONN')
+    conn = psycopg2.connect(conn_str)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM FactSalesPerformance;")
+                result = cur.fetchone()
+                if result[0] < 1:
+                    raise ValueError("Incremental load validation failed: FactSalesPerformance is empty.")
+                else:
+                    print("Incremental load validation passed.")
+    finally:
+        conn.close()
+
+default_args = {
+    'owner': 'data_engineer',
+    'depends_on_past': False,
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5),
+    'email_on_failure': False
+}
 
 with DAG(
     dag_id='dwh_incremental_load',
     default_args=default_args,
-    description='Інкрементне оновлення OLAP-сховища (SCD2 для вимірів, інкрементне завантаження фактів та агрегованих таблиць)',
-    schedule_interval='@daily',  # Або встановіть інтервал за потребою
+    description='Incremental update of the OLAP warehouse including SCD type 2 updates and fact/aggregate load',
+    schedule_interval='@daily',
     start_date=datetime(2020, 1, 1),
     catchup=False
 ) as dag:
 
-    t_detect_changed_data = PythonOperator(
+    t_detect = PythonOperator(
         task_id='detect_changed_data',
         python_callable=detect_changed_data
     )
@@ -123,10 +141,10 @@ with DAG(
         python_callable=update_aggregate
     )
 
-    t_validate_incremental = PythonOperator(
+    t_validate = PythonOperator(
         task_id='validate_incremental',
         python_callable=validate_incremental,
         provide_context=True
     )
 
-    t_detect_changed_data >> t_update_dimensions >> t_update_fact >> t_update_aggregate >> t_validate_incremental
+    t_detect >> t_update_dimensions >> t_update_fact >> t_update_aggregate >> t_validate
