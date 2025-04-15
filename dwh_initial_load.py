@@ -1,21 +1,24 @@
 from datetime import datetime, timedelta
-import os
 import psycopg2
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.hooks.base import BaseHook
 
-# Utility function to run a SQL command using psycopg2
-def run_query(sql):
-    conn_str = os.getenv('OLAP_B2B_SALES_CONN')
-    if not conn_str:
-        raise ValueError("OLAP_B2B_SALES_CONN environment variable is not set")
-    conn = psycopg2.connect(conn_str)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(sql)
-    finally:
-        conn.close()
+def run_query_using_airflow_connection(conn_id: str, sql: str):
+    """Run a SQL query using psycopg2, retrieving credentials from the Airflow connection UI."""
+    # 1. Fetch the Connection object from Airflow
+    airflow_conn = BaseHook.get_connection(conn_id)
+    
+    # 2. Build the psycopg2 connection string from the retrieved credentials
+    conn_str = (
+        f"postgresql://{airflow_conn.login}:{airflow_conn.password}"
+        f"@{airflow_conn.host}:{airflow_conn.port}/{airflow_conn.schema}"
+    )
+    
+    # 3. Connect and execute the query
+    with psycopg2.connect(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
 
 def create_tables(**kwargs):
     sql = """
@@ -98,19 +101,18 @@ def create_tables(**kwargs):
         FOREIGN KEY (DealStageKey) REFERENCES DimDealStage(StageID)
     );
     """
-    run_query(sql)
+    run_query_using_airflow_connection(conn_id="b2b_sales", sql=sql)
 
 def load_dimensions(**kwargs):
-    # Placeholder SQL to load dimensions from the OLTP source.
-    # Replace with your actual ETL logic.
+    # Placeholder: Replace with your extraction logic from OLTP source
     sql = """
     INSERT INTO DimAccount (AccountID, AccountName, Sector, RevenueRange, ParentAccountID)
     SELECT AccountID, AccountName, Sector, RevenueRange, ParentAccountID FROM OLTP_Accounts;
     """
-    run_query(sql)
+    run_query_using_airflow_connection(conn_id="b2b_sales", sql=sql)
 
 def load_fact(**kwargs):
-    # Placeholder SQL to load data into FactSalesPerformance.
+    # Placeholder: Replace with your extraction and transformation logic
     sql = """
     INSERT INTO FactSalesPerformance 
        (DateKey, AccountKey, ProductKey, SalesAgentKey, DealStageKey, CloseValue, DurationDays, ExpectedSuccessRate)
@@ -123,7 +125,7 @@ def load_fact(**kwargs):
     JOIN DimSalesAgent s ON sp.SalesAgentID = s.SalesAgentID
     JOIN DimDealStage ds ON sp.DealStage = ds.StageName;
     """
-    run_query(sql)
+    run_query_using_airflow_connection(conn_id="b2b_sales", sql=sql)
 
 def compute_aggregate(**kwargs):
     sql = """
@@ -143,22 +145,23 @@ def compute_aggregate(**kwargs):
     JOIN DimDealStage ds ON sp.DealStageKey = ds.StageID
     GROUP BY d.Year, d.Month, s.Region, ds.StageID;
     """
-    run_query(sql)
+    run_query_using_airflow_connection(conn_id="b2b_sales", sql=sql)
 
 def validate_initial_load(**kwargs):
-    conn_str = os.getenv('OLAP_B2B_SALES_CONN')
-    conn = psycopg2.connect(conn_str)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM FactSalesPerformance;")
-                result = cur.fetchone()
-                if result[0] < 1:
-                    raise ValueError("Initial load validation failed: FactSalesPerformance is empty.")
-                else:
-                    print("Initial load validation passed.")
-    finally:
-        conn.close()
+    # Retrieve a record count as a simple validation
+    conn_obj = BaseHook.get_connection("b2b_sales")
+    conn_str = (
+        f"postgresql://{conn_obj.login}:{conn_obj.password}"
+        f"@{conn_obj.host}:{conn_obj.port}/{conn_obj.schema}"
+    )
+    with psycopg2.connect(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM FactSalesPerformance;")
+            result = cur.fetchone()
+            if result[0] < 1:
+                raise ValueError("Initial load validation failed: FactSalesPerformance is empty.")
+            else:
+                print("Initial load validation passed.")
 
 default_args = {
     'owner': 'data_engineer',
@@ -171,7 +174,7 @@ default_args = {
 with DAG(
     dag_id='dwh_initial_load',
     default_args=default_args,
-    description='Initial load into OLAP data warehouse using psycopg2 directly.',
+    description='Initial load into OLAP warehouse (dimensions, fact, aggregates) using connection id b2b_sales',
     schedule_interval=None,
     start_date=datetime(2020, 1, 1),
     catchup=False
