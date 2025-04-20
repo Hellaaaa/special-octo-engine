@@ -1,10 +1,7 @@
 from datetime import datetime, timedelta
 import logging
 import psycopg2
-from airflow import DAG
-from airflow.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
-from airflow.models import Variable
 from psycopg2 import sql
 import json
 
