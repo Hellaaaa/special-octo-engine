@@ -63,15 +63,16 @@ def reset_batch_state(variable_name):
     ### B2B Sales Initial Load DAG (Repopulatable)
 
     Performs the initial population of the OLAP database from the OLTP source.
-    **This version TRUNCATES target tables first using PythonOperators, allowing it to be re-run.**
+    **This version TRUNCATES target tables first using PythonOperators and CASCADE, allowing it to be re-run.**
 
-    **WARNING:** Running this DAG will WIPE existing data in the target OLAP tables.
+    **WARNING:** Running this DAG will WIPE existing data in the target OLAP tables
+    and potentially cascade to other tables if FKs are complex.
 
     **Tasks:**
     0.  Start.
     1.  Reset Batch State Variables.
     2.  Truncate OLAP Fact Tables (using CASCADE via PythonOperator).
-    3.  Truncate OLAP Dimension Tables (via PythonOperator).
+    3.  Truncate OLAP Dimension Tables (using CASCADE via PythonOperator).
     4.  Load DimDate (pre-populate or generate).
     5.  Load DimDealStage.
     6.  Load DimAccount (batched).
@@ -124,28 +125,30 @@ def b2b_initial_load_dag():
 
     @task(task_id='truncate_fact_sales_monthly_aggregate')
     def python_truncate_fact_monthly_aggregate():
-        _truncate_table("FactSalesMonthlyAggregate", cascade=True)
+        _truncate_table("FactSalesMonthlyAggregate", cascade=True) # Assuming this might also be referenced
 
-    # Truncate Dimension Tables (Referenced by Facts)
+    # Truncate Dimension Tables (Referenced by Facts) - Using CASCADE now
+    # WARNING: Using CASCADE here is necessary due to FK constraints but ensure
+    # you understand which rows in referencing tables (like facts) will be deleted.
     @task(task_id='truncate_dim_account')
     def python_truncate_dim_account():
-        _truncate_table("DimAccount") # No cascade needed if facts are truncated first
+        _truncate_table("DimAccount", cascade=True) # Added CASCADE
 
     @task(task_id='truncate_dim_product')
     def python_truncate_dim_product():
-        _truncate_table("DimProduct")
+        _truncate_table("DimProduct", cascade=True) # Added CASCADE
 
     @task(task_id='truncate_dim_sales_agent')
     def python_truncate_dim_sales_agent():
-        _truncate_table("DimSalesAgent")
+        _truncate_table("DimSalesAgent", cascade=True) # Added CASCADE
 
     @task(task_id='truncate_dim_deal_stage')
     def python_truncate_dim_deal_stage():
-        _truncate_table("DimDealStage")
+        _truncate_table("DimDealStage", cascade=True) # Added CASCADE
 
     @task(task_id='truncate_dim_date')
     def python_truncate_dim_date():
-        _truncate_table("DimDate")
+        _truncate_table("DimDate", cascade=True) # Added CASCADE
 
     # Instantiate Truncate Tasks
     truncate_fact_sales_perf_task = python_truncate_fact_sales_performance()
@@ -455,7 +458,7 @@ def b2b_initial_load_dag():
     cross_downstream(truncate_facts, truncate_dims)
 
     # Load dimensions after truncation. They can run in parallel.
-    # Set dependency from list of tasks to list of tasks using cross_downstream (FIXED)
+    # Set dependency from list of tasks to list of tasks using cross_downstream
     cross_downstream(truncate_dims, load_dims_tasks)
 
     # Load facts only after all dimensions are loaded
