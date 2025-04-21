@@ -5,7 +5,8 @@ from datetime import timedelta
 
 from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.providers.postgres.operators.postgres import PostgresOperator
+# Removed PostgresOperator import as it's no longer used for truncate
+# from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.models import Variable
 from airflow.exceptions import AirflowSkipException
 from airflow.models.baseoperator import cross_downstream
@@ -62,21 +63,22 @@ def reset_batch_state(variable_name):
     ### B2B Sales Initial Load DAG (Repopulatable)
 
     Performs the initial population of the OLAP database from the OLTP source.
-    **This version TRUNCATES target tables first, allowing it to be re-run.**
+    **This version TRUNCATES target tables first using PythonOperators, allowing it to be re-run.**
 
     **WARNING:** Running this DAG will WIPE existing data in the target OLAP tables.
 
     **Tasks:**
     0.  Start.
-    1.  Truncate OLAP Fact Tables (using CASCADE).
-    2.  Truncate OLAP Dimension Tables.
-    3.  Load DimDate (pre-populate or generate).
-    4.  Load DimDealStage.
-    5.  Load DimAccount (batched).
-    6.  Load DimProduct (batched, sets initial validity).
-    7.  Load DimSalesAgent (batched).
-    8.  Load FactSalesPerformance (batched).
-    9.  End.
+    1.  Reset Batch State Variables.
+    2.  Truncate OLAP Fact Tables (using CASCADE via PythonOperator).
+    3.  Truncate OLAP Dimension Tables (via PythonOperator).
+    4.  Load DimDate (pre-populate or generate).
+    5.  Load DimDealStage.
+    6.  Load DimAccount (batched).
+    7.  Load DimProduct (batched, sets initial validity).
+    8.  Load DimSalesAgent (batched).
+    9.  Load FactSalesPerformance (batched).
+    10. End.
 
     **Recovery:** Uses Airflow Variables (`initial_load_[table]_offset`)
     to track batch progress within a single run. These are reset at the start.
@@ -88,7 +90,6 @@ def b2b_initial_load_dag():
     end = EmptyOperator(task_id='end')
 
     # --- Task Group: Reset Batch State Variables ---
-    # Ensures that if the DAG is re-run, it starts loading from offset 0
     @task
     def reset_all_batch_states():
         state_vars = [
@@ -102,69 +103,73 @@ def b2b_initial_load_dag():
 
     task_reset_states = reset_all_batch_states()
 
-    # --- Task Group: Truncate Tables ---
+    # --- Task Group: Truncate Tables using PythonOperator ---
+
+    def _truncate_table(table_name: str, cascade: bool = False):
+        """Helper Python function to truncate a table."""
+        hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
+        sql = f"TRUNCATE TABLE {table_name}"
+        if cascade:
+            sql += " CASCADE"
+        sql += ";"
+        logging.info(f"Running TRUNCATE command: {sql}")
+        hook.run(sql)
+        logging.info(f"Successfully truncated table {table_name}.")
+
+    # Truncate Fact Tables (depend on Dimensions) - Using CASCADE
     # WARNING: Using CASCADE can have unintended consequences if FKs are complex.
-    # Ensure you understand your schema's dependencies.
-    # Alternatively, truncate tables in the correct dependency order (facts first).
+    @task(task_id='truncate_fact_sales_performance')
+    def python_truncate_fact_sales_performance():
+        _truncate_table("FactSalesPerformance", cascade=True)
 
-    # Truncate Fact Tables (depend on Dimensions)
-    truncate_fact_sales_perf = PostgresOperator(
-        task_id='truncate_fact_sales_performance',
-        postgres_conn_id=OLAP_CONN_ID,
-        sql="TRUNCATE TABLE FactSalesPerformance CASCADE;", # Use CASCADE carefully
-        doc_md="Truncates FactSalesPerformance table using CASCADE."
-    )
-
-    truncate_fact_monthly_agg = PostgresOperator(
-        task_id='truncate_fact_sales_monthly_aggregate',
-        postgres_conn_id=OLAP_CONN_ID,
-        sql="TRUNCATE TABLE FactSalesMonthlyAggregate CASCADE;", # Use CASCADE carefully
-        doc_md="Truncates FactSalesMonthlyAggregate table using CASCADE."
-    )
+    @task(task_id='truncate_fact_sales_monthly_aggregate')
+    def python_truncate_fact_monthly_aggregate():
+        _truncate_table("FactSalesMonthlyAggregate", cascade=True)
 
     # Truncate Dimension Tables (Referenced by Facts)
-    # No need for CASCADE if facts are already truncated
-    truncate_dim_account = PostgresOperator(
-        task_id='truncate_dim_account',
-        postgres_conn_id=OLAP_CONN_ID,
-        sql="TRUNCATE TABLE DimAccount;",
-    )
-    truncate_dim_product = PostgresOperator(
-        task_id='truncate_dim_product',
-        postgres_conn_id=OLAP_CONN_ID,
-        sql="TRUNCATE TABLE DimProduct;",
-    )
-    truncate_dim_sales_agent = PostgresOperator(
-        task_id='truncate_dim_sales_agent',
-        postgres_conn_id=OLAP_CONN_ID,
-        sql="TRUNCATE TABLE DimSalesAgent;",
-    )
-    truncate_dim_deal_stage = PostgresOperator(
-        task_id='truncate_dim_deal_stage',
-        postgres_conn_id=OLAP_CONN_ID,
-        sql="TRUNCATE TABLE DimDealStage;",
-    )
-    truncate_dim_date = PostgresOperator(
-        task_id='truncate_dim_date',
-        postgres_conn_id=OLAP_CONN_ID,
-        sql="TRUNCATE TABLE DimDate;",
-    )
+    @task(task_id='truncate_dim_account')
+    def python_truncate_dim_account():
+        _truncate_table("DimAccount") # No cascade needed if facts are truncated first
 
-    # Group Truncate Tasks for clarity
-    truncate_facts = [truncate_fact_sales_perf, truncate_fact_monthly_agg]
+    @task(task_id='truncate_dim_product')
+    def python_truncate_dim_product():
+        _truncate_table("DimProduct")
+
+    @task(task_id='truncate_dim_sales_agent')
+    def python_truncate_dim_sales_agent():
+        _truncate_table("DimSalesAgent")
+
+    @task(task_id='truncate_dim_deal_stage')
+    def python_truncate_dim_deal_stage():
+        _truncate_table("DimDealStage")
+
+    @task(task_id='truncate_dim_date')
+    def python_truncate_dim_date():
+        _truncate_table("DimDate")
+
+    # Instantiate Truncate Tasks
+    truncate_fact_sales_perf_task = python_truncate_fact_sales_performance()
+    truncate_fact_monthly_agg_task = python_truncate_fact_monthly_aggregate()
+    truncate_dim_account_task = python_truncate_dim_account()
+    truncate_dim_product_task = python_truncate_dim_product()
+    truncate_dim_sales_agent_task = python_truncate_dim_sales_agent()
+    truncate_dim_deal_stage_task = python_truncate_dim_deal_stage()
+    truncate_dim_date_task = python_truncate_dim_date()
+
+    # Group Truncate Tasks for dependency setting
+    truncate_facts = [truncate_fact_sales_perf_task, truncate_fact_monthly_agg_task]
     truncate_dims = [
-        truncate_dim_account,
-        truncate_dim_product,
-        truncate_dim_sales_agent,
-        truncate_dim_deal_stage,
-        truncate_dim_date
+        truncate_dim_account_task,
+        truncate_dim_product_task,
+        truncate_dim_sales_agent_task,
+        truncate_dim_deal_stage_task,
+        truncate_dim_date_task
     ]
-
 
     # --- Task: Dimension - Date (Example: Generate if needed) ---
     @task
     def load_dim_date():
-        # This task now runs *after* truncate_dim_date
+        # This task now runs *after* truncate_dim_date_task
         hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
         sql = """
         INSERT INTO DimDate (DateKey, Date, Day, Month, Quarter, Year)
@@ -180,7 +185,6 @@ def b2b_initial_load_dag():
             '2025-12-31'::DATE,
             '1 day'::INTERVAL
         ) datum;
-        -- Removed ON CONFLICT as table is truncated first
         """
         hook_olap.run(sql)
         logging.info("DimDate populated.")
@@ -188,7 +192,7 @@ def b2b_initial_load_dag():
     # --- Task: Dimension - DealStage ---
     @task
     def load_dim_deal_stage():
-        # This task now runs *after* truncate_dim_deal_stage
+        # This task now runs *after* truncate_dim_deal_stage_task
         hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
         hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
         stages = hook_oltp.get_records("SELECT DealStageID, StageName FROM DealStages")
@@ -198,7 +202,6 @@ def b2b_initial_load_dag():
                 rows=stages,
                 target_fields=["StageID", "StageName"],
                 commit_every=DEFAULT_BATCH_SIZE
-                # replace=False is default and correct after truncate
             )
             logging.info(f"Loaded {len(stages)} rows into DimDealStage.")
         else:
@@ -207,7 +210,7 @@ def b2b_initial_load_dag():
     # --- Task: Dimension - Account (Batched) ---
     @task
     def load_dim_account():
-        # This task now runs *after* truncate_dim_account
+        # This task now runs *after* truncate_dim_account_task
         variable_name = "initial_load_dim_account_offset"
         batch_size = DEFAULT_BATCH_SIZE
         total_rows_processed = 0
@@ -244,7 +247,6 @@ def b2b_initial_load_dag():
                      rows=olap_data,
                      target_fields=["AccountID", "AccountName", "Sector", "RevenueRange", "ParentAccountID"],
                      commit_every=batch_size
-                     # replace=False is default and correct after truncate
                  )
                  rows_loaded = len(olap_data)
                  logging.info(f"Loaded batch of {rows_loaded} accounts.")
@@ -262,7 +264,7 @@ def b2b_initial_load_dag():
     # --- Task: Dimension - Product (Batched, Initial Validity) ---
     @task
     def load_dim_product():
-        # This task now runs *after* truncate_dim_product
+        # This task now runs *after* truncate_dim_product_task
         variable_name = "initial_load_dim_product_offset"
         batch_size = DEFAULT_BATCH_SIZE
         total_rows_processed = 0
@@ -302,7 +304,6 @@ def b2b_initial_load_dag():
                      rows=olap_data,
                      target_fields=["ProductID", "ProductName", "SeriesName", "Price", "PriceRange", "ValidFrom", "ValidTo", "IsCurrent"],
                      commit_every=batch_size
-                     # replace=False is default and correct after truncate
                  )
                  rows_loaded = len(olap_data)
                  logging.info(f"Loaded batch of {rows_loaded} products.")
@@ -320,7 +321,7 @@ def b2b_initial_load_dag():
     # --- Task: Dimension - SalesAgent (Batched) ---
     @task
     def load_dim_sales_agent():
-        # This task now runs *after* truncate_dim_sales_agent
+        # This task now runs *after* truncate_dim_sales_agent_task
         variable_name = "initial_load_dim_sales_agent_offset"
         batch_size = DEFAULT_BATCH_SIZE
         total_rows_processed = 0
@@ -352,7 +353,6 @@ def b2b_initial_load_dag():
                     rows=olap_data,
                     target_fields=["SalesAgentID", "SalesAgentName", "ManagerName", "Region"],
                     commit_every=batch_size
-                    # replace=False is default and correct after truncate
                 )
                 rows_loaded = len(olap_data)
                 logging.info(f"Loaded batch of {rows_loaded} sales agents.")
@@ -370,7 +370,7 @@ def b2b_initial_load_dag():
     # --- Task: Fact Table - SalesPerformance (Batched) ---
     @task
     def load_fact_sales_performance():
-        # This task now runs *after* truncate_fact_sales_perf and after dims are loaded
+        # This task now runs *after* truncate_fact_sales_perf_task and after dims are loaded
         variable_name = "initial_load_fact_sales_perf_offset"
         batch_size = DEFAULT_BATCH_SIZE
         total_rows_processed = 0
@@ -401,7 +401,6 @@ def b2b_initial_load_dag():
                 logging.info("No more sales pipeline data to process.")
                 break
 
-            # Prepare data for OLAP Fact table (Direct Key mapping is OK for initial load)
             olap_data = [
                 (row[10], row[3], row[2], row[1], row[4], row[7], row[8], row[9])
                 for row in source_data
