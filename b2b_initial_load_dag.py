@@ -448,12 +448,18 @@ def b2b_initial_load_dag():
 
     # Truncate facts first (due to FKs from facts to dims), then truncate dims
     # Using CASCADE on fact tables simplifies this, otherwise truncate facts then dims.
-    task_reset_states >> truncate_facts >> truncate_dims
+    # Set dependency from single task to list
+    task_reset_states >> truncate_facts
+
+    # Set dependency from list of tasks to list of tasks using cross_downstream
+    cross_downstream(truncate_facts, truncate_dims)
 
     # Load dimensions after truncation. They can run in parallel.
+    # Set dependency from list of tasks to list of tasks
     truncate_dims >> load_dims_tasks
 
     # Load facts only after all dimensions are loaded
+    # Set dependency from list of tasks to single task
     load_dims_tasks >> task_load_facts
 
     task_load_facts >> end
