@@ -62,11 +62,12 @@ def reset_batch_state(variable_name):
     default_args={'retries': 1, 'retry_delay': timedelta(minutes=2)},
     tags=['b2b_sales', 'initial_load', 'repopulatable'],
     doc_md="""
-    ### B2B Sales Initial Load DAG (Repopulatable - Dynamic DimDate)
+    ### B2B Sales Initial Load DAG (Repopulatable - Fixed NULL AccountKey)
 
     Performs the initial population of the OLAP database from the OLTP source.
     **This version TRUNCATES target tables first using PythonOperators and CASCADE, allowing it to be re-run.**
     **DimDate range is now determined dynamically from source data.**
+    **Filters out fact records with NULL AccountID from source.**
 
     **WARNING:** Running this DAG will WIPE existing data in the target OLAP tables
     and potentially cascade to other tables if FKs are complex.
@@ -423,6 +424,7 @@ def b2b_initial_load_dag():
             logging.info(f"Processing FactSalesPerformance batch starting from offset {current_offset}")
 
             hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
+            # Added WHERE clause to filter NULLs on FK columns before attempting insert
             sql_extract = """
             SELECT
                 sp.OpportunityID, sp.SalesAgentID, sp.ProductID, sp.AccountID, sp.DealStageID,
@@ -436,12 +438,17 @@ def b2b_initial_load_dag():
                 TO_CHAR(COALESCE(sp.CloseDate, sp.EngageDate, CURRENT_DATE), 'YYYYMMDD')::INT AS DateKey
             FROM SalesPipeline sp
             LEFT JOIN DealStages ds ON sp.DealStageID = ds.DealStageID
+            WHERE sp.AccountID IS NOT NULL -- Filter rows with NULL AccountID
+              AND sp.ProductID IS NOT NULL -- Filter rows with NULL ProductID (assuming required)
+              AND sp.SalesAgentID IS NOT NULL -- Filter rows with NULL SalesAgentID (assuming required)
+              AND sp.DealStageID IS NOT NULL -- Filter rows with NULL DealStageID (assuming required)
+              AND COALESCE(sp.CloseDate, sp.EngageDate) IS NOT NULL -- Ensure a valid date exists for DateKey
             ORDER BY sp.OpportunityID LIMIT %s OFFSET %s;
             """
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
 
             if not source_data:
-                logging.info("No more sales pipeline data to process.")
+                logging.info("No more valid sales pipeline data to process.")
                 break
 
             olap_data = [
@@ -509,3 +516,4 @@ def b2b_initial_load_dag():
 
 # Instantiate the DAG
 b2b_initial_load_dag()
+
