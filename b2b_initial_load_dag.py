@@ -1,7 +1,7 @@
 # /path/to/your/airflow/dags/b2b_initial_load_dag.py
 import pendulum
 import logging
-from datetime import timedelta
+from datetime import timedelta, date
 
 from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
@@ -16,6 +16,8 @@ from airflow.operators.empty import EmptyOperator
 OLTP_CONN_ID = "b2b_sales"
 OLAP_CONN_ID = "b2b_sales_olap"
 DEFAULT_BATCH_SIZE = 1000  # Limit rows per transaction/command as requested
+DEFAULT_MIN_DATE = '2015-01-01' # Default start date if source is empty
+DEFAULT_MAX_DATE = '2030-12-31' # Default end date if source is empty
 
 # --- Helper Functions ---
 # Batch state functions remain useful if a single run is very long and fails mid-way,
@@ -60,10 +62,11 @@ def reset_batch_state(variable_name):
     default_args={'retries': 1, 'retry_delay': timedelta(minutes=2)},
     tags=['b2b_sales', 'initial_load', 'repopulatable'],
     doc_md="""
-    ### B2B Sales Initial Load DAG (Repopulatable)
+    ### B2B Sales Initial Load DAG (Repopulatable - Dynamic DimDate)
 
     Performs the initial population of the OLAP database from the OLTP source.
     **This version TRUNCATES target tables first using PythonOperators and CASCADE, allowing it to be re-run.**
+    **DimDate range is now determined dynamically from source data.**
 
     **WARNING:** Running this DAG will WIPE existing data in the target OLAP tables
     and potentially cascade to other tables if FKs are complex.
@@ -73,7 +76,7 @@ def reset_batch_state(variable_name):
     1.  Reset Batch State Variables.
     2.  Truncate OLAP Fact Tables (using CASCADE via PythonOperator).
     3.  Truncate OLAP Dimension Tables (using CASCADE via PythonOperator).
-    4.  Load DimDate (pre-populate or generate).
+    4.  Load DimDate (dynamically determines range).
     5.  Load DimDealStage.
     6.  Load DimAccount (batched).
     7.  Load DimProduct (batched, sets initial validity).
@@ -169,12 +172,48 @@ def b2b_initial_load_dag():
         truncate_dim_date_task
     ]
 
-    # --- Task: Dimension - Date (Example: Generate if needed) ---
+    # --- Task: Dimension - Date (Dynamically determine range) ---
     @task
     def load_dim_date():
         # This task now runs *after* truncate_dim_date_task
+        hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
         hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-        sql = """
+
+        # Find min/max dates from source data
+        sql_get_range = """
+        SELECT MIN(EngageDate), MAX(COALESCE(CloseDate, EngageDate))
+        FROM SalesPipeline;
+        """
+        logging.info("Querying OLTP for date range...")
+        result = hook_oltp.get_first(sql_get_range)
+
+        min_date_str = DEFAULT_MIN_DATE
+        max_date_str = DEFAULT_MAX_DATE
+
+        if result and result[0] and result[1]:
+            # Ensure results are date objects if they aren't already
+            min_dt = result[0]
+            max_dt = result[1]
+            if isinstance(min_dt, str):
+                 min_dt = pendulum.parse(min_dt).date()
+            if isinstance(max_dt, str):
+                 max_dt = pendulum.parse(max_dt).date()
+            # Convert date objects to string for SQL query
+            min_date_str = min_dt.strftime('%Y-%m-%d')
+            max_date_str = max_dt.strftime('%Y-%m-%d')
+            logging.info(f"Determined date range from OLTP: {min_date_str} to {max_date_str}")
+        else:
+            logging.warning("Could not determine date range from OLTP or source table empty. Using defaults.")
+            logging.info(f"Using default date range: {min_date_str} to {max_date_str}")
+
+        # Add padding (e.g., start from beginning of min year, end at end of max year)
+        min_year_start = pendulum.parse(min_date_str).start_of('year').to_date_string()
+        max_year_end = pendulum.parse(max_date_str).end_of('year').to_date_string()
+        logging.info(f"Using padded date range for DimDate generation: {min_year_start} to {max_year_end}")
+
+
+        # Generate and insert dates
+        sql_insert_dates = f"""
         INSERT INTO DimDate (DateKey, Date, Day, Month, Quarter, Year)
         SELECT
             TO_CHAR(datum, 'YYYYMMDD')::INT AS DateKey,
@@ -184,12 +223,13 @@ def b2b_initial_load_dag():
             EXTRACT(QUARTER FROM datum) AS Quarter,
             EXTRACT(YEAR FROM datum) AS Year
         FROM generate_series(
-            '2020-01-01'::DATE,
-            '2025-12-31'::DATE,
+            '{min_year_start}'::DATE,
+            '{max_year_end}'::DATE,
             '1 day'::INTERVAL
         ) datum;
         """
-        hook_olap.run(sql)
+        logging.info("Populating DimDate...")
+        hook_olap.run(sql_insert_dates)
         logging.info("DimDate populated.")
 
     # --- Task: Dimension - DealStage ---
