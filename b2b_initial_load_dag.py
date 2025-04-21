@@ -455,8 +455,8 @@ def b2b_initial_load_dag():
     cross_downstream(truncate_facts, truncate_dims)
 
     # Load dimensions after truncation. They can run in parallel.
-    # Set dependency from list of tasks to list of tasks
-    truncate_dims >> load_dims_tasks
+    # Set dependency from list of tasks to list of tasks using cross_downstream (FIXED)
+    cross_downstream(truncate_dims, load_dims_tasks)
 
     # Load facts only after all dimensions are loaded
     # Set dependency from list of tasks to single task
