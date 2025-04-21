@@ -7,6 +7,7 @@ from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.models import Variable
 from airflow.exceptions import AirflowSkipException
+from airflow.models.baseoperator import cross_downstream # Import added
 
 # --- Configuration ---
 OLTP_CONN_ID = "b2b_sales"
@@ -21,10 +22,23 @@ def get_batch_state(variable_name, default_value=0):
     except ValueError:
         logging.warning(f"Variable {variable_name} not found or not an integer, using default {default_value}")
         return default_value
+    except Exception as e:
+        # Handle cases where Variable backend might be unavailable temporarily
+        logging.error(f"Could not retrieve variable {variable_name}: {e}")
+        # Depending on requirements, either fail or use default
+        logging.warning(f"Using default {default_value} due to error retrieving variable.")
+        return default_value
+
 
 def set_batch_state(variable_name, value):
     """Sets the starting offset for the next batch."""
-    Variable.set(variable_name, str(value))
+    try:
+        Variable.set(variable_name, str(value))
+    except Exception as e:
+         # Log error but potentially allow DAG to continue if variable setting isn't critical path
+         # Or re-raise depending on desired fault tolerance
+        logging.error(f"Could not set variable {variable_name}: {e}")
+
 
 def execute_load_batch(target_conn_id, sql, data):
     """Executes batch insert/upsert."""
@@ -41,6 +55,7 @@ def execute_load_batch(target_conn_id, sql, data):
     # A better approach for bulk inserts is hook.insert_rows() or copy_expert
 
     rows_affected = 0
+    conn = None # Initialize conn outside try
     try:
         # Example: hook.insert_rows(table='your_table', rows=data)
         # Using generic execute for flexibility with potential ON CONFLICT
@@ -48,17 +63,20 @@ def execute_load_batch(target_conn_id, sql, data):
         cur = conn.cursor()
         for row in data:
              cur.execute(sql, row) # Pass row as parameters
-             rows_affected += cur.rowcount
+             rows_affected += cur.rowcount # Note: rowcount might not be reliable for all statements/DBs
         conn.commit()
         cur.close()
-        conn.close()
-        logging.info(f"Successfully loaded {rows_affected} rows.")
-        return rows_affected
+        logging.info(f"Successfully loaded batch. Rows affected (approx): {rows_affected}")
+        # Return len(data) as a more reliable indicator of processed batch items
+        return len(data)
     except Exception as e:
         logging.error(f"Error loading batch: {e}")
-        # Consider rolling back if not autocommit
-        # conn.rollback() # depends on hook/connection settings
-        raise
+        if conn: # Rollback if connection was established
+            conn.rollback()
+        raise # Re-raise the exception to fail the task
+    finally:
+        if conn: # Ensure connection is closed
+             conn.close()
 
 
 # --- DAG Definition ---
@@ -173,33 +191,28 @@ def b2b_initial_load_dag():
             ]
 
             # Load into OLAP
-            sql_load = """
-            INSERT INTO DimAccount (AccountID, AccountName, Sector, RevenueRange, ParentAccountID)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (AccountID) DO UPDATE SET -- Or DO NOTHING if initial load shouldn't update
-                AccountName = EXCLUDED.AccountName,
-                Sector = EXCLUDED.Sector,
-                RevenueRange = EXCLUDED.RevenueRange,
-                ParentAccountID = EXCLUDED.ParentAccountID;
-             """
+            hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
             try:
-                # Using insert_rows is generally better for pure inserts
-                 hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
+                 # Using insert_rows is generally better for pure inserts
+                 # It handles conflicts based on primary/unique keys if replace=True
+                 # For initial load, ON CONFLICT might be safer if run multiple times
+                 # Let's stick to insert_rows with replace=True for simplicity assuming
+                 # we want the latest OLTP data if run again over existing data.
+                 # If you need strict "insert only if not exists", use execute_load_batch with ON CONFLICT DO NOTHING
                  hook_olap.insert_rows(
                      table="DimAccount",
                      rows=olap_data,
                      target_fields=["AccountID", "AccountName", "Sector", "RevenueRange", "ParentAccountID"],
                      commit_every=batch_size,
-                     replace=False, # Important for initial load if run multiple times
+                     replace=True, # Set to True to UPSERT based on PK
                      replace_index="AccountID" # Specify the primary key for conflict checking
                  )
                  rows_loaded = len(olap_data) # insert_rows doesn't return rows affected directly easily
-                 logging.info(f"Loaded batch of {rows_loaded} accounts.")
-
-                 # rows_loaded = execute_load_batch(OLAP_CONN_ID, sql_load, olap_data) # Alternative if ON CONFLICT needed
+                 logging.info(f"Loaded/Updated batch of {rows_loaded} accounts.")
 
                  total_rows_processed += rows_loaded
-                 set_batch_state(variable_name, current_offset + rows_loaded) # Update offset
+                 # Update offset based on rows processed in this batch
+                 set_batch_state(variable_name, current_offset + rows_loaded)
 
                  # Optional: Check if fewer rows were returned than batch size asked for
                  if len(source_data) < batch_size:
@@ -270,11 +283,11 @@ def b2b_initial_load_dag():
                      rows=olap_data,
                      target_fields=["ProductID", "ProductName", "SeriesName", "Price", "PriceRange", "ValidFrom", "ValidTo", "IsCurrent"],
                      commit_every=batch_size,
-                     replace=False,
+                     replace=True, # Use Upsert logic for initial load too
                      replace_index="ProductID"
                  )
                  rows_loaded = len(olap_data)
-                 logging.info(f"Loaded batch of {rows_loaded} products.")
+                 logging.info(f"Loaded/Updated batch of {rows_loaded} products.")
 
                  total_rows_processed += rows_loaded
                  set_batch_state(variable_name, current_offset + rows_loaded)
@@ -331,11 +344,11 @@ def b2b_initial_load_dag():
                     rows=olap_data,
                     target_fields=["SalesAgentID", "SalesAgentName", "ManagerName", "Region"],
                     commit_every=batch_size,
-                    replace=False,
+                    replace=True, # Use Upsert logic
                     replace_index="SalesAgentID"
                 )
                 rows_loaded = len(olap_data)
-                logging.info(f"Loaded batch of {rows_loaded} sales agents.")
+                logging.info(f"Loaded/Updated batch of {rows_loaded} sales agents.")
 
                 total_rows_processed += rows_loaded
                 set_batch_state(variable_name, current_offset + rows_loaded)
@@ -403,6 +416,7 @@ def b2b_initial_load_dag():
 
             # Prepare data for OLAP Fact table
             # Map source IDs directly to OLAP keys (assuming they match for initial load)
+            # In incremental load, MUST lookup keys from OLAP dimensions.
             olap_data = [
                 (
                     row[10], # DateKey
@@ -416,7 +430,7 @@ def b2b_initial_load_dag():
                 ) for row in source_data
             ]
 
-            # Load into OLAP Fact table
+            # Load into OLAP Fact table (Append only for facts typically)
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
             try:
                 hook_olap.insert_rows(
@@ -458,9 +472,10 @@ def b2b_initial_load_dag():
     fact_sales_task = load_fact_sales_performance()
 
     # Dimensions can run in parallel after Date and Stage (simplest deps)
-    [dim_date_task, dim_stage_task] >> [dim_account_task, dim_product_task, dim_agent_task]
+    # Use cross_downstream for list-to-list dependency
+    cross_downstream([dim_date_task, dim_stage_task], [dim_account_task, dim_product_task, dim_agent_task])
 
-    # Fact load depends on all dimensions being loaded
+    # Fact load depends on all dimensions being loaded (list-to-task dependency is fine)
     [dim_account_task, dim_product_task, dim_agent_task] >> fact_sales_task
 
 # Instantiate the DAG
