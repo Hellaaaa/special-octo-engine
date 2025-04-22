@@ -5,46 +5,39 @@ from datetime import timedelta
 
 from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-# Removed: from airflow.sensors.external_task import ExternalTaskSensor
 from airflow.operators.empty import EmptyOperator
 
 # --- Configuration ---
-OLAP_CONN_ID = "b2b_sales_olap" # Connection ID for your OLAP database
-# Removed: SOURCE_INCREMENTAL_DAG_ID = "b2b_incremental_load"
-# Removed: SOURCE_INCREMENTAL_TASK_ID = "end_incremental_load"
+OLAP_CONN_ID = "b2b_sales_olap"
 
 # --- DAG Definition ---
 @dag(
-    dag_id='b2b_aggregate_calculation_no_wait', # Changed ID slightly to avoid conflict
-    start_date=pendulum.datetime(2024, 1, 1, tz="UTC"), # Start date for scheduling
-    schedule='@daily', # Schedule to run daily
-    catchup=False, # Avoid running for past missed schedules
+    dag_id='b2b_aggregate_calculation',
+    start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
+    schedule='@daily',
+    catchup=False,
     default_args={
-        # 'retries': 1, # REMOVED: Number of retries on failure
-        'retry_delay': timedelta(minutes=5), # Delay between retries (kept in case of manual retry)
-        'owner': 'airflow', # Assign an owner
+        'retries': 1,
+        'retry_delay': timedelta(seconds=15),
+        'owner': 'airflow',
     },
-    tags=['b2b_sales', 'aggregate', 'refined', 'no_wait'],
+    tags=['b2b_sales', 'aggregate'],
     doc_md="""
-    ### B2B Sales Monthly Aggregate Calculation DAG (No Wait - Retries Removed)
+    ### B2B Sales Monthly Aggregate Calculation DAG
 
     **Завдання 3:** Обчислює місячні агрегати продажів на основі таблиці `FactSalesPerformance`
     і завантажує їх у `FactSalesMonthlyAggregate`.
 
     **Стратегія:** Truncate and Reload.
 
-    **ЗАЛЕЖНІСТЬ ВИДАЛЕНО:** Цей DAG запускається за розкладом `@daily`
     **НЕЗАЛЕЖНО** від стану `b2b_incremental_load`.
     **ПОПЕРЕДЖЕННЯ:** Агрегати можуть бути обчислені на основі неповних даних,
     якщо цей DAG запуститься раніше, ніж `b2b_incremental_load` оновить `FactSalesPerformance`.
-    **РЕТРАЇ ВИМКНЕНО.**
     """
 )
-def b2b_aggregate_calculation_no_wait_dag():
+def b2b_aggregate_calculation_dag():
 
     start = EmptyOperator(task_id='start_aggregate_calculation')
-
-    # REMOVED the ExternalTaskSensor definition
 
     @task
     def calculate_and_load_aggregates():
@@ -53,8 +46,6 @@ def b2b_aggregate_calculation_no_wait_dag():
         Runs based on schedule, does not wait for upstream DAGs. No automatic retries on failure.
         """
         hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-
-        # 1. Truncate the aggregate table
         sql_truncate = "TRUNCATE TABLE FactSalesMonthlyAggregate;"
         logging.info(f"Truncating {sql_truncate}...")
         try:
@@ -62,9 +53,8 @@ def b2b_aggregate_calculation_no_wait_dag():
             logging.info("Table FactSalesMonthlyAggregate truncated successfully.")
         except Exception as e:
             logging.error(f"Error truncating FactSalesMonthlyAggregate: {e}")
-            raise # Fail the task if truncate fails
+            raise
 
-        # 2. Calculate and Insert Aggregates
         logging.info("Calculating and inserting aggregates into FactSalesMonthlyAggregate...")
         sql_aggregate = """
         INSERT INTO FactSalesMonthlyAggregate (
@@ -87,14 +77,12 @@ def b2b_aggregate_calculation_no_wait_dag():
             logging.info("Aggregates calculated and inserted successfully.")
         except Exception as e:
             logging.error(f"Error calculating/inserting aggregates: {e}")
-            raise # Fail the task
+            raise
 
     task_calculate = calculate_and_load_aggregates()
 
     end = EmptyOperator(task_id='end_aggregate_calculation')
 
-    # Define dependencies - REMOVED wait_for_incremental
     start >> task_calculate >> end
 
-# Instantiate the DAG
-b2b_aggregate_calculation_no_wait_dag()
+b2b_aggregate_calculation_dag()

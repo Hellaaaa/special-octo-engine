@@ -2,11 +2,10 @@
 import pendulum
 import logging
 from datetime import timedelta, datetime
-# Ensure psycopg2 errors can be caught if needed, requires postgres provider installed
 try:
     import psycopg2
 except ImportError:
-    psycopg2 = None # Allows code to run but specific DB error checks might fail
+    psycopg2 = None
 
 from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
@@ -17,8 +16,8 @@ from airflow.exceptions import AirflowNotFoundException
 # --- Configuration ---
 OLTP_CONN_ID = "b2b_sales"
 OLAP_CONN_ID = "b2b_sales_olap"
-DEFAULT_START_TIME = '1970-01-01T00:00:00+00:00' # Default start for first run
-WATERMARK_VAR_PREFIX = "b2b_incremental_watermark_" # Prefix for timestamp watermarks
+DEFAULT_START_TIME = '1970-01-01T00:00:00+00:00'
+WATERMARK_VAR_PREFIX = "b2b_incremental_watermark_"
 
 # --- Helper: Watermark Management (Timestamp-based) ---
 def get_watermark(table_key: str) -> str:
@@ -45,22 +44,14 @@ def set_watermark(table_key: str, value: str):
     start_date=pendulum.datetime(2024, 1, 1, tz="UTC"),
     schedule='@daily',
     catchup=False,
-    # default_args={'retries': 2, 'retry_delay': timedelta(minutes=5)}, # Commented out for testing
-    default_args={'retry_delay': timedelta(minutes=5)},
-    tags=['b2b_sales', 'incremental_load', 'refined', 'scd2_product_only', 'timestamp_watermark'],
+    default_args={'retries': 2, 'retry_delay': timedelta(seconds=15)},
+    tags=['incremental_load', 'scd', 'timestamp_watermark'],
     doc_md="""
-    ### B2B Sales Incremental Load DAG (Fact Insert-Only Workaround)
+    ### B2B Sales Incremental Load DAG 
 
     Loads new and updated data from OLTP to OLAP using `updated_at` timestamps and watermarks.
-    Implements **SCD Type 2** ONLY for `DimProduct`.
-    Implements **SCD Type 1** (Upsert) for `DimAccount` and `DimSalesAgent`.
-    Uses **INSERT ONLY** for `FactSalesPerformance` (Workaround - does not handle updates).
-
-    **Assumptions:**
-    - OLTP tables have a reliable `updated_at` column.
-    - `DimProduct` in OLAP has `ValidFrom`, `ValidTo`, `IsCurrent` columns.
-    - `DimAccount`, `DimSalesAgent` in OLAP DO NOT have SCD2 columns.
-    - `FactSalesPerformance` DOES NOT have `OpportunityID`.
+    Implements **SCD** ONLY for `DimProduct`.
+    Uses **INSERT ONLY** for `FactSalesPerformance`.
 
     **CDC/Watermarking:** Uses `updated_at` and Airflow Variables.
 
@@ -76,7 +67,6 @@ def b2b_incremental_load_dag():
     start = EmptyOperator(task_id='start_incremental_load')
     end = EmptyOperator(task_id='end_incremental_load')
 
-    # --- Task 1: Dimension - Account (Incremental Update - SCD Type 1 - Upsert) ---
     @task
     def update_dim_account(**context):
         table_key = 'accounts'; start_time_str = get_watermark(table_key)
@@ -95,7 +85,6 @@ def b2b_incremental_load_dag():
             logging.info(f"Upserted {len(olap_data)} records into DimAccount (SCD1)."); set_watermark(table_key, end_time_iso)
         except Exception as e: logging.error(f"Error during Upsert into DimAccount (SCD1): {e}"); raise
 
-    # --- Task 2: Dimension - Product (Incremental Update - SCD Type 2) ---
     @task
     def update_dim_product(**context):
         table_key = 'products'; start_time_str = get_watermark(table_key)
@@ -129,7 +118,6 @@ def b2b_incremental_load_dag():
             logging.info(f"SCD Type 2 processing complete for DimProduct. Processed: {processed_count}"); set_watermark(table_key, end_time_iso)
         except Exception as e: logging.error(f"Error during SCD Type 2 for DimProduct: {e}"); raise
 
-    # --- Task 3: Dimension - SalesAgent (Incremental Update - SCD Type 1 - Upsert) ---
     @task
     def update_dim_sales_agent(**context):
         table_key = 'salesagents'; start_time_str = get_watermark(table_key)
@@ -148,7 +136,6 @@ def b2b_incremental_load_dag():
             logging.info(f"Upserted {len(olap_data)} records into DimSalesAgent (SCD1)."); set_watermark(table_key, end_time_iso)
         except Exception as e: logging.error(f"Error during Upsert into DimSalesAgent (SCD1): {e}"); raise
 
-    # --- Task 4: Fact Table - SalesPerformance (Incremental Load - INSERT ONLY) ---
     @task
     def update_fact_sales_performance(**context):
         table_key = 'salespipeline'; start_time_str = get_watermark(table_key)
@@ -166,10 +153,9 @@ def b2b_incremental_load_dag():
         olap_data_to_insert = []; missing_keys_count = 0
         for row in changed_data:
             try:
-                # Unpack row, ignoring OpportunityID for insertion list
                 opportunity_id, oltp_sales_agent_id, oltp_product_id, oltp_account_id, oltp_deal_stage_id, _, _, close_value, duration_days, expected_success_rate, event_date = row
                 event_date_str = event_date.strftime('%Y-%m-%d') if hasattr(event_date, 'strftime') else str(event_date)
-                # Perform lookups
+
                 date_key_res = hook_olap.get_first("SELECT DateKey FROM DimDate WHERE Date = %s", parameters=(event_date_str,))
                 account_key_res = hook_olap.get_first("SELECT AccountID FROM DimAccount WHERE AccountID = %s", parameters=(oltp_account_id,))
                 product_key_res = hook_olap.get_first("SELECT ProductID FROM DimProduct WHERE ProductID = %s AND %s >= ValidFrom AND (%s < ValidTo OR ValidTo IS NULL)", parameters=(oltp_product_id, event_date_str, event_date_str))
@@ -179,7 +165,6 @@ def b2b_incremental_load_dag():
                 product_key = product_key_res[0] if product_key_res else None; agent_key = agent_key_res[0] if agent_key_res else None
                 stage_key = stage_key_res[0] if stage_key_res else None
                 if all([date_key, account_key, product_key, agent_key, stage_key]):
-                     # Append tuple WITHOUT OpportunityID
                      olap_data_to_insert.append((date_key, account_key, product_key, agent_key, stage_key, close_value, duration_days, expected_success_rate))
                 else: missing_keys_count += 1; logging.warning(f"Skipping OppID {opportunity_id} due to missing dim key for EventDate {event_date_str}. Found: [D:{date_key is not None}, A:{account_key is not None}, P:{product_key is not None}, Ag:{agent_key is not None}, S:{stage_key is not None}]")
             except Exception as lookup_ex: missing_keys_count += 1; logging.error(f"Dim lookup error for OppID {row[0]} (EventDate: {row[10]}): {lookup_ex}")
@@ -190,18 +175,15 @@ def b2b_incremental_load_dag():
         logging.info(f"Prepared {len(olap_data_to_insert)} records for INSERT into FactSalesPerformance.");
         if missing_keys_count > 0: logging.warning(f"Skipped {missing_keys_count} fact records due to missing dim keys.")
 
-        # Perform INSERT ONLY into OLAP Fact table
         try:
-            # Define target fields WITHOUT OpportunityID
             target_fields = ["DateKey", "AccountKey", "ProductKey", "SalesAgentKey", "DealStageKey", "CloseValue", "DurationDays", "ExpectedSuccessRate"]
             hook_olap.insert_rows(table="FactSalesPerformance", rows=olap_data_to_insert, target_fields=target_fields, commit_every=1000)
             logging.info(f"Successfully INSERTED {len(olap_data_to_insert)} records into FactSalesPerformance.")
-            set_watermark(table_key, end_time_iso) # Update watermark upon successful completion
+            set_watermark(table_key, end_time_iso)
         except Exception as e:
             logging.error(f"Error during INSERT into FactSalesPerformance: {e}")
-            raise # Fail task if insert fails
+            raise
 
-    # --- Task Dependencies ---
     task_update_account = update_dim_account()
     task_update_product = update_dim_product()
     task_update_agent = update_dim_sales_agent()
@@ -211,5 +193,4 @@ def b2b_incremental_load_dag():
     [task_update_account, task_update_product, task_update_agent] >> task_update_facts
     task_update_facts >> end
 
-# Instantiate the DAG
 b2b_incremental_load_dag()
