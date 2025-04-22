@@ -20,13 +20,13 @@ OLAP_CONN_ID = "b2b_sales_olap" # Connection ID for your OLAP database
     schedule='@daily', # Schedule to run daily
     catchup=False, # Avoid running for past missed schedules
     default_args={
-        'retries': 1, # Number of retries on failure
-        'retry_delay': timedelta(minutes=5), # Delay between retries
+        # 'retries': 1, # REMOVED: Number of retries on failure
+        'retry_delay': timedelta(minutes=5), # Delay between retries (kept in case of manual retry)
         'owner': 'airflow', # Assign an owner
     },
     tags=['b2b_sales', 'aggregate', 'refined', 'no_wait'],
     doc_md="""
-    ### B2B Sales Monthly Aggregate Calculation DAG (No Wait)
+    ### B2B Sales Monthly Aggregate Calculation DAG (No Wait - Retries Removed)
 
     **Завдання 3:** Обчислює місячні агрегати продажів на основі таблиці `FactSalesPerformance`
     і завантажує їх у `FactSalesMonthlyAggregate`.
@@ -37,6 +37,7 @@ OLAP_CONN_ID = "b2b_sales_olap" # Connection ID for your OLAP database
     **НЕЗАЛЕЖНО** від стану `b2b_incremental_load`.
     **ПОПЕРЕДЖЕННЯ:** Агрегати можуть бути обчислені на основі неповних даних,
     якщо цей DAG запуститься раніше, ніж `b2b_incremental_load` оновить `FactSalesPerformance`.
+    **РЕТРАЇ ВИМКНЕНО.**
     """
 )
 def b2b_aggregate_calculation_no_wait_dag():
@@ -49,7 +50,7 @@ def b2b_aggregate_calculation_no_wait_dag():
     def calculate_and_load_aggregates():
         """
         Truncates the aggregate table and re-calculates aggregates from FactSalesPerformance.
-        Runs based on schedule, does not wait for upstream DAGs.
+        Runs based on schedule, does not wait for upstream DAGs. No automatic retries on failure.
         """
         hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
 
