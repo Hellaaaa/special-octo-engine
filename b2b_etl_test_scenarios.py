@@ -9,7 +9,7 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 # Removed: from airflow.sensors.external_task import ExternalTaskSensor
-# Removed: from airflow.utils.state import State
+from airflow.utils.state import State # <-- ADDED IMPORT
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.exceptions import AirflowSkipException
 
@@ -70,7 +70,9 @@ def b2b_etl_test_scenarios_dag():
             hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
             original_agent_data = None
             original_opp_data = None
-            new_opp_id_s1 = TEST_OPP_ID_S1_NEW # Get run-specific Opp ID
+            # Generate unique Opp ID for this run using Airflow macro
+            ti = context['ti'] # Get task instance from context
+            new_opp_id_s1 = f'TEST_INC_NEW_{ti.dag_run.id}' # Use dag_run.id for uniqueness
 
             logging.info("--- Scenario 1: Modifying OLTP Data ---")
             try:
@@ -128,12 +130,12 @@ def b2b_etl_test_scenarios_dag():
         trigger_incremental_s1 = TriggerDagRunOperator(
             task_id="trigger_incremental_load_s1",
             trigger_dag_id=INCREMENTAL_DAG_ID,
-            conf={"triggered_by_test": "scenario_1", "run_id": f"test_s1_{{{{ ts_nodash }}}}"},
+            conf={"triggered_by_test": "scenario_1", "run_id": f"test_s1_{{{{ dag_run.id }}}}"}, # Use current dag_run.id for uniqueness
             wait_for_completion=True, # Wait for the triggered DAG to finish
             poke_interval=30,         # How often to check status
             timeout=1800,             # Timeout for waiting (30 mins)
-            allowed_states=[State.SUCCESS], # Required state
-            failed_states=[State.FAILED, State.UPSTREAM_FAILED] # States that cause this task to fail
+            allowed_states=[State.SUCCESS], # Required state - USES IMPORTED State
+            failed_states=[State.FAILED, State.UPSTREAM_FAILED] # States that cause this task to fail - USES IMPORTED State
         )
 
         @task
@@ -182,11 +184,11 @@ def b2b_etl_test_scenarios_dag():
             logging.info("--- Scenario 1: OLAP Verification Complete (Check Logs) ---")
 
         @task(trigger_rule=TriggerRule.ALL_DONE) # Run cleanup regardless of verification status
-        def cleanup_oltp_s1(original_data: dict, modify_task_output: dict):
+        def cleanup_oltp_s1(modify_task_output: dict): # Get output from modify task via XComs
             """Reverts changes made in OLTP for Scenario 1."""
-            # original_data is passed implicitly via task dependency / XComs
             hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
             new_opp_id = modify_task_output.get("new_opp_id") # Get the generated Opp ID
+            original_data = modify_task_output # The whole dict is the original data context
             logging.info("--- Scenario 1: Cleaning Up OLTP Data ---")
             try:
                 # Delete new SalesPipeline record
@@ -223,8 +225,8 @@ def b2b_etl_test_scenarios_dag():
 
         # Define flow for Scenario 1
         modify_oltp_task = modify_oltp_s1()
-        verify_olap_task = verify_olap_s1() # Define verify task
-        cleanup_oltp_task = cleanup_oltp_s1(modify_oltp_task, modify_oltp_task) # Pass XCom implicitly and explicitly
+        verify_olap_task = verify_olap_s1()
+        cleanup_oltp_task = cleanup_oltp_s1(modify_oltp_task) # Pass XCom implicitly
 
         modify_oltp_task >> trigger_incremental_s1 >> verify_olap_task >> cleanup_oltp_task
 
@@ -254,12 +256,12 @@ def b2b_etl_test_scenarios_dag():
         trigger_incremental_s2 = TriggerDagRunOperator(
             task_id="trigger_incremental_load_s2",
             trigger_dag_id=INCREMENTAL_DAG_ID,
-            conf={"triggered_by_test": "scenario_2", "run_id": f"test_s2_{{{{ ts_nodash }}}}"},
+            conf={"triggered_by_test": "scenario_2", "run_id": f"test_s2_{{{{ dag_run.id }}}}"}, # Use current dag_run.id
             wait_for_completion=True, # Wait for the triggered DAG to finish
             poke_interval=30,
             timeout=1800,
-            allowed_states=[State.SUCCESS],
-            failed_states=[State.FAILED, State.UPSTREAM_FAILED]
+            allowed_states=[State.SUCCESS], # USES IMPORTED State
+            failed_states=[State.FAILED, State.UPSTREAM_FAILED] # USES IMPORTED State
         )
 
         @task
@@ -273,8 +275,8 @@ def b2b_etl_test_scenarios_dag():
                 logging.info(f"Check Product History (ID={TEST_PROD_ID_S2}):\n{json.dumps(res_prod, indent=2, default=str)}")
                 if len(res_prod) < 2: logging.warning("Verification FAILED: Expected at least 2 versions for Product, found less.")
                 elif not res_prod[0][5]: logging.warning("Verification FAILED: Expected latest version for Product to be IsCurrent=TRUE.")
-                elif res_prod[1][5]: logging.warning("Verification FAILED: Expected previous version for Product to be IsCurrent=FALSE.")
-                elif not res_prod[1][4]: logging.warning("Verification FAILED: Expected previous version for Product to have a ValidTo date.")
+                elif len(res_prod) > 1 and res_prod[1][5]: logging.warning("Verification FAILED: Expected previous version for Product to be IsCurrent=FALSE.") # Check index exists before accessing
+                elif len(res_prod) > 1 and not res_prod[1][4]: logging.warning("Verification FAILED: Expected previous version for Product to have a ValidTo date.") # Check index exists
             except Exception as e: logging.error(f"Error during OLAP verification for Scenario 2: {e}")
             logging.info("--- Scenario 2: OLAP Verification Complete (Check Logs) ---")
 
