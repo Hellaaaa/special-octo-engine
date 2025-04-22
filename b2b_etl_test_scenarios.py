@@ -29,15 +29,19 @@ TEST_ACC_NAME_S1 = f'Test New Account Inc - ID {TEST_ACC_ID_S1_NEW}' # Include I
 TEST_AGENT_ID_S1 = 5
 TEST_AGENT_MANAGER_ID_S1_ORIG = 1 # Placeholder - Get the actual original value if needed for complex revert
 TEST_AGENT_MANAGER_ID_S1_NEW = 5 # As per scenario
-TEST_OPP_ID_S1_NEW = f'TEST_INC_NEW_{{{{ dag_run.id }}}}' # Make new OppID unique per run
+# Generate unique Opp ID based on the test DAG run's ID
+TEST_OPP_ID_S1_NEW = f'TEST_INC_NEW_{{{{ dag_run.id }}}}'
 TEST_OPP_ID_S1_UPDATE = 'SBCR987L' # Existing OpportunityID to update
+# Store original/new values for the updated opportunity
 TEST_OPP_S1_UPDATE_ORIG_STAGE = 1 # Placeholder - Get the actual original value if needed for complex revert
 TEST_OPP_S1_UPDATE_NEW_STAGE = 4 # As per scenario
 TEST_OPP_S1_UPDATE_ORIG_VALUE = 590.00 # Placeholder - Get the actual original value if needed for complex revert
 TEST_OPP_S1_UPDATE_NEW_VALUE = 650.00 # As per scenario
+# Store other keys associated with the updated opportunity for verification lookup
 TEST_OPP_S1_UPDATE_ACC_ID = 83 # AccountID associated with SBCR987L
 TEST_OPP_S1_UPDATE_PROD_ID = 1 # ProductID associated with SBCR987L
 TEST_OPP_S1_UPDATE_AGENT_ID = 32 # SalesAgentID associated with SBCR987L
+
 
 TEST_PROD_ID_S2 = 3
 TEST_PROD_NAME_S2_SUFFIX = ' (Updated Scenario 2)'
@@ -52,7 +56,7 @@ TEST_PROD_PRICE_MULTIPLIER_S2 = 1.1
     default_args={'owner': 'airflow', 'retries': 0}, # No retries for tests
     tags=['b2b_sales', 'test', 'etl'],
     doc_md="""
-    ### ETL Test Scenarios DAG (Fixed Verification Queries)
+    ### ETL Test Scenarios DAG (Fixed NameError)
 
     Automates running test scenarios described previously.
     Triggers the incremental load DAG and waits for it to complete.
@@ -96,7 +100,8 @@ def b2b_etl_test_scenarios_dag():
                 sql_update_agent = f"""UPDATE SalesAgents SET ManagerID = {TEST_AGENT_MANAGER_ID_S1_NEW}, updated_at = NOW() WHERE SalesAgentID = {TEST_AGENT_ID_S1};"""
                 logging.info(f"Updating SalesAgentID {TEST_AGENT_ID_S1}...")
                 hook_oltp.run(sql_update_agent)
-                sql_insert_opp = f"""INSERT INTO SalesPipeline (OpportunityID, SalesAgentID, ProductID, AccountID, DealStageID, EngageDate, CloseDate, CloseValue, created_at, updated_at) VALUES ('{new_opp_id_s1}', {TEST_AGENT_ID_S1}, {TEST_PROD_ID_S2}, {TEST_ACC_ID_S1_NEW}, {TEST_OPP_STAGE_S1_ORIG}, CURRENT_DATE - INTERVAL '10 days', CURRENT_DATE, 1234.56, NOW(), NOW());"""
+                # ** CORRECTED VARIABLE NAME HERE **
+                sql_insert_opp = f"""INSERT INTO SalesPipeline (OpportunityID, SalesAgentID, ProductID, AccountID, DealStageID, EngageDate, CloseDate, CloseValue, created_at, updated_at) VALUES ('{new_opp_id_s1}', {TEST_AGENT_ID_S1}, {TEST_PROD_ID_S2}, {TEST_ACC_ID_S1_NEW}, {original_opp_stage_id}, CURRENT_DATE - INTERVAL '10 days', CURRENT_DATE, 1234.56, NOW(), NOW());"""
                 logging.info(f"Inserting new SalesPipeline record (OppID: {new_opp_id_s1})...")
                 hook_oltp.run(sql_insert_opp)
                 sql_update_opp = f"""UPDATE SalesPipeline SET DealStageID = {TEST_OPP_S1_UPDATE_NEW_STAGE}, CloseValue = {TEST_OPP_S1_UPDATE_NEW_VALUE}, updated_at = NOW() WHERE OpportunityID = '{TEST_OPP_ID_S1_UPDATE}';"""
@@ -139,7 +144,6 @@ def b2b_etl_test_scenarios_dag():
                 if not res_fact_new or res_fact_new[0] < 1: logging.warning("Verification FAILED: New fact record not found.")
 
                 # 4. Check updated Fact record - **CORRECTED QUERY (No OpportunityID)**
-                # Checks if *a* record exists with the updated stage and value for the known keys.
                 sql_check_fact_upd = f"""
                 SELECT COUNT(*)
                 FROM FactSalesPerformance f
@@ -183,6 +187,7 @@ def b2b_etl_test_scenarios_dag():
         modify_oltp_task >> trigger_incremental_s1 >> verify_olap_task >> cleanup_oltp_task
 
     # --- Scenario 2 Group ---
+    # (Scenario 2 group remains the same as previous version)
     @task_group(group_id='scenario_2_scd2_product')
     def scenario_2_group():
         @task
@@ -224,14 +229,9 @@ def b2b_etl_test_scenarios_dag():
                 elif len(res_prod) > 1 and res_prod[1][5]: logging.warning("Verification FAILED: Expected previous version for Product to be IsCurrent=FALSE.")
                 elif len(res_prod) > 1 and not res_prod[1][4]: logging.warning("Verification FAILED: Expected previous version for Product to have a ValidTo date.")
             except Exception as e:
-                # Check if error is due to missing 'Price' column
-                if psycopg2 and isinstance(e, psycopg2.errors.UndefinedColumn) and "price" in str(e).lower() and "salesprice" not in str(e).lower():
-                     logging.error(f"Hint: Verification failed because column 'Price' might not exist in DimProduct. Check schema and initial/incremental load DAGs.")
-                # Check if error is due to originally trying 'SalesPrice'
-                elif psycopg2 and isinstance(e, psycopg2.errors.UndefinedColumn) and "salesprice" in str(e).lower():
-                     logging.error(f"Hint: Verification failed because column 'SalesPrice' does not exist. The query was updated to use 'Price'. Check DimProduct schema.")
-                else:
-                     logging.error(f"Error during OLAP verification for Scenario 2: {e}")
+                if psycopg2 and isinstance(e, psycopg2.errors.UndefinedColumn) and "price" in str(e).lower() and "salesprice" not in str(e).lower(): logging.error(f"Hint: Verification failed because column 'Price' might not exist in DimProduct.")
+                elif psycopg2 and isinstance(e, psycopg2.errors.UndefinedColumn) and "salesprice" in str(e).lower(): logging.error(f"Hint: Verification failed because column 'SalesPrice' does not exist. Query uses 'Price'.")
+                else: logging.error(f"Error during OLAP verification for Scenario 2: {e}")
             logging.info("--- Scenario 2: OLAP Verification Complete (Check Logs) ---")
 
         @task(trigger_rule=TriggerRule.ALL_DONE)
