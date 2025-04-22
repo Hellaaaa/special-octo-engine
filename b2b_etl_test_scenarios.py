@@ -12,6 +12,11 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.utils.state import State # Required for allowed_states/failed_states
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.exceptions import AirflowSkipException
+# Ensure psycopg2 errors can be caught if needed
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
 
 # --- Configuration ---
 OLTP_CONN_ID = "b2b_sales" # Connection ID for your source OLTP database
@@ -22,16 +27,17 @@ INCREMENTAL_DAG_ID = "b2b_incremental_load" # The DAG ID to trigger and wait for
 TEST_ACC_ID_S1_NEW = 99999 # Explicit ID for the new test account
 TEST_ACC_NAME_S1 = f'Test New Account Inc - ID {TEST_ACC_ID_S1_NEW}' # Include ID in name
 TEST_AGENT_ID_S1 = 5
-# TEST_AGENT_REGION_S1_ORIG = 'Original Region S1' # Placeholder - Not used in current logic
 TEST_AGENT_MANAGER_ID_S1_ORIG = 1 # Placeholder - Get the actual original value if needed for complex revert
 TEST_AGENT_MANAGER_ID_S1_NEW = 5 # As per scenario
-# Generate unique Opp ID based on the test DAG run's ID
-TEST_OPP_ID_S1_NEW = f'TEST_INC_NEW_{{{{ dag_run.id }}}}'
+TEST_OPP_ID_S1_NEW = f'TEST_INC_NEW_{{{{ dag_run.id }}}}' # Make new OppID unique per run
 TEST_OPP_ID_S1_UPDATE = 'SBCR987L' # Existing OpportunityID to update
-TEST_OPP_STAGE_S1_ORIG = 1 # Placeholder - Get the actual original value if needed for complex revert
-TEST_OPP_STAGE_S1_NEW = 4 # As per scenario
-TEST_OPP_VALUE_S1_ORIG = 590.00 # Placeholder - Get the actual original value if needed for complex revert
-TEST_OPP_VALUE_S1_NEW = 650.00 # As per scenario
+TEST_OPP_S1_UPDATE_ORIG_STAGE = 1 # Placeholder - Get the actual original value if needed for complex revert
+TEST_OPP_S1_UPDATE_NEW_STAGE = 4 # As per scenario
+TEST_OPP_S1_UPDATE_ORIG_VALUE = 590.00 # Placeholder - Get the actual original value if needed for complex revert
+TEST_OPP_S1_UPDATE_NEW_VALUE = 650.00 # As per scenario
+TEST_OPP_S1_UPDATE_ACC_ID = 83 # AccountID associated with SBCR987L
+TEST_OPP_S1_UPDATE_PROD_ID = 1 # ProductID associated with SBCR987L
+TEST_OPP_S1_UPDATE_AGENT_ID = 32 # SalesAgentID associated with SBCR987L
 
 TEST_PROD_ID_S2 = 3
 TEST_PROD_NAME_S2_SUFFIX = ' (Updated Scenario 2)'
@@ -46,7 +52,7 @@ TEST_PROD_PRICE_MULTIPLIER_S2 = 1.1
     default_args={'owner': 'airflow', 'retries': 0}, # No retries for tests
     tags=['b2b_sales', 'test', 'etl'],
     doc_md="""
-    ### ETL Test Scenarios DAG (Fixed State Args)
+    ### ETL Test Scenarios DAG (Fixed Verification Queries)
 
     Automates running test scenarios described previously.
     Triggers the incremental load DAG and waits for it to complete.
@@ -71,74 +77,41 @@ def b2b_etl_test_scenarios_dag():
             hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
             original_agent_data = None
             original_opp_data = None
-            # Generate unique Opp ID for this run using Airflow context
-            ti = context['ti'] # Get task instance from context
-            # Use a simpler unique ID for testing if dag_run.id is complex/long
+            ti = context['ti']
             new_opp_id_s1 = f'TEST_S1_{ti.run_id[-8:]}' # Use last 8 chars of run_id
 
             logging.info("--- Scenario 1: Modifying OLTP Data ---")
             try:
-                # Get original data for cleanup later (optional but good practice)
                 original_agent_data = hook_oltp.get_first(f"SELECT ManagerID FROM SalesAgents WHERE SalesAgentID = {TEST_AGENT_ID_S1}")
                 original_opp_data = hook_oltp.get_first(f"SELECT DealStageID, CloseValue FROM SalesPipeline WHERE OpportunityID = '{TEST_OPP_ID_S1_UPDATE}'")
-
+                original_agent_manager_id = original_agent_data[0] if original_agent_data else TEST_AGENT_MANAGER_ID_S1_ORIG
+                original_opp_stage_id = original_opp_data[0] if original_opp_data else TEST_OPP_S1_UPDATE_ORIG_STAGE
+                original_opp_close_value = original_opp_data[1] if original_opp_data else TEST_OPP_S1_UPDATE_ORIG_VALUE
                 if not original_agent_data: logging.warning(f"Could not find original data for SalesAgentID {TEST_AGENT_ID_S1}")
                 if not original_opp_data: logging.warning(f"Could not find original data for OpportunityID {TEST_OPP_ID_S1_UPDATE}")
 
-                # 1. Insert new Account with explicit ID
-                sql_insert_acc = f"""
-                INSERT INTO Accounts (AccountID, AccountName, SectorID, YearEstablished, Revenue, Employees, HeadquartersID, created_at, updated_at)
-                VALUES ({TEST_ACC_ID_S1_NEW}, '{TEST_ACC_NAME_S1}', 1, 2025, 50000.00, 10, 1, NOW(), NOW())
-                ON CONFLICT (AccountID) DO NOTHING; -- Avoid error if test account already exists from failed cleanup
-                """
+                sql_insert_acc = f"""INSERT INTO Accounts (AccountID, AccountName, SectorID, YearEstablished, Revenue, Employees, HeadquartersID, created_at, updated_at) VALUES ({TEST_ACC_ID_S1_NEW}, '{TEST_ACC_NAME_S1}', 1, 2025, 50000.00, 10, 1, NOW(), NOW()) ON CONFLICT (AccountID) DO NOTHING;"""
                 logging.info(f"Inserting/Ensuring Account with ID: {TEST_ACC_ID_S1_NEW}")
                 hook_oltp.run(sql_insert_acc)
-
-                # 2. Update existing SalesAgent
-                sql_update_agent = f"""
-                UPDATE SalesAgents SET ManagerID = {TEST_AGENT_MANAGER_ID_S1_NEW}, updated_at = NOW()
-                WHERE SalesAgentID = {TEST_AGENT_ID_S1};"""
+                sql_update_agent = f"""UPDATE SalesAgents SET ManagerID = {TEST_AGENT_MANAGER_ID_S1_NEW}, updated_at = NOW() WHERE SalesAgentID = {TEST_AGENT_ID_S1};"""
                 logging.info(f"Updating SalesAgentID {TEST_AGENT_ID_S1}...")
                 hook_oltp.run(sql_update_agent)
-
-                # 3. Insert new SalesPipeline record
-                sql_insert_opp = f"""
-                INSERT INTO SalesPipeline (OpportunityID, SalesAgentID, ProductID, AccountID, DealStageID, EngageDate, CloseDate, CloseValue, created_at, updated_at)
-                VALUES ('{new_opp_id_s1}', {TEST_AGENT_ID_S1}, {TEST_PROD_ID_S2}, {TEST_ACC_ID_S1_NEW}, {TEST_OPP_STAGE_S1_ORIG}, CURRENT_DATE - INTERVAL '10 days', CURRENT_DATE, 1234.56, NOW(), NOW());"""
+                sql_insert_opp = f"""INSERT INTO SalesPipeline (OpportunityID, SalesAgentID, ProductID, AccountID, DealStageID, EngageDate, CloseDate, CloseValue, created_at, updated_at) VALUES ('{new_opp_id_s1}', {TEST_AGENT_ID_S1}, {TEST_PROD_ID_S2}, {TEST_ACC_ID_S1_NEW}, {TEST_OPP_STAGE_S1_ORIG}, CURRENT_DATE - INTERVAL '10 days', CURRENT_DATE, 1234.56, NOW(), NOW());"""
                 logging.info(f"Inserting new SalesPipeline record (OppID: {new_opp_id_s1})...")
                 hook_oltp.run(sql_insert_opp)
-
-                # 4. Update existing SalesPipeline record
-                sql_update_opp = f"""
-                UPDATE SalesPipeline SET DealStageID = {TEST_OPP_STAGE_S1_NEW}, CloseValue = {TEST_OPP_VALUE_S1_NEW}, updated_at = NOW()
-                WHERE OpportunityID = '{TEST_OPP_ID_S1_UPDATE}';"""
+                sql_update_opp = f"""UPDATE SalesPipeline SET DealStageID = {TEST_OPP_S1_UPDATE_NEW_STAGE}, CloseValue = {TEST_OPP_S1_UPDATE_NEW_VALUE}, updated_at = NOW() WHERE OpportunityID = '{TEST_OPP_ID_S1_UPDATE}';"""
                 logging.info(f"Updating SalesPipeline OpportunityID {TEST_OPP_ID_S1_UPDATE}...")
                 hook_oltp.run(sql_update_opp)
-
                 logging.info("--- Scenario 1: OLTP Modifications Complete ---")
-                # Pass original values and generated IDs for cleanup
-                return {
-                    "new_account_id": TEST_ACC_ID_S1_NEW,
-                    "new_opp_id": new_opp_id_s1,
-                    "original_agent_manager_id": original_agent_data[0] if original_agent_data else None,
-                    "original_opp_stage_id": original_opp_data[0] if original_opp_data else None,
-                    "original_opp_close_value": original_opp_data[1] if original_opp_data else None
-                }
-            except Exception as e:
-                logging.error(f"Error modifying OLTP data for Scenario 1: {e}")
-                raise
+                return {"new_account_id": TEST_ACC_ID_S1_NEW, "new_opp_id": new_opp_id_s1, "original_agent_manager_id": original_agent_manager_id, "original_opp_stage_id": original_opp_stage_id, "original_opp_close_value": original_opp_close_value}
+            except Exception as e: logging.error(f"Error modifying OLTP data for Scenario 1: {e}"); raise
 
-        # Define Trigger Operator at the DAG level within the group
         trigger_incremental_s1 = TriggerDagRunOperator(
             task_id="trigger_incremental_load_s1",
             trigger_dag_id=INCREMENTAL_DAG_ID,
-            conf={"triggered_by_test": "scenario_1", "run_id": f"test_s1_{{{{ dag_run.id }}}}"}, # Use current dag_run.id for uniqueness
-            wait_for_completion=True, # Wait for the triggered DAG to finish
-            poke_interval=30,         # How often to check status
-            # timeout=1800,           # REMOVED INVALID ARGUMENT
-            allowed_states=[State.SUCCESS], # Required state
-            # Corrected: Use only valid DagRunState values
-            failed_states=[State.FAILED]
+            conf={"triggered_by_test": "scenario_1", "run_id": f"test_s1_{{{{ dag_run.id }}}}"},
+            wait_for_completion=True, poke_interval=30,
+            allowed_states=[State.SUCCESS], failed_states=[State.FAILED]
         )
 
         @task
@@ -157,8 +130,7 @@ def b2b_etl_test_scenarios_dag():
                 sql_check_agent = f"SELECT SalesAgentID, ManagerName FROM DimSalesAgent WHERE SalesAgentID = {TEST_AGENT_ID_S1}"
                 res_agent = hook_olap.get_first(sql_check_agent)
                 logging.info(f"Check Updated Agent (ID={TEST_AGENT_ID_S1}): {res_agent}")
-                # Add specific check if ManagerName is expected to change and DimSalesManager exists
-                # if not res_agent or res_agent[1] != EXPECTED_MANAGER_NAME_AFTER_UPDATE: logging.warning("Verification FAILED: Agent update incorrect.")
+                # Add specific check if ManagerName is expected to change
 
                 # 3. Check new Fact record (basic check)
                 sql_check_fact_new = f"SELECT COUNT(*) FROM FactSalesPerformance WHERE AccountKey = {TEST_ACC_ID_S1_NEW}"
@@ -166,64 +138,48 @@ def b2b_etl_test_scenarios_dag():
                 logging.info(f"Check New Fact (AccountKey={TEST_ACC_ID_S1_NEW}): Count = {res_fact_new[0] if res_fact_new else 'Error'}")
                 if not res_fact_new or res_fact_new[0] < 1: logging.warning("Verification FAILED: New fact record not found.")
 
-                # 4. Check updated Fact record (assuming UPSERT worked and OpportunityID is in Fact table)
+                # 4. Check updated Fact record - **CORRECTED QUERY (No OpportunityID)**
+                # Checks if *a* record exists with the updated stage and value for the known keys.
                 sql_check_fact_upd = f"""
-                SELECT COUNT(*), MAX(DealStageKey), MAX(CloseValue)
-                FROM FactSalesPerformance
-                WHERE OpportunityID = '{TEST_OPP_ID_S1_UPDATE}'
+                SELECT COUNT(*)
+                FROM FactSalesPerformance f
+                WHERE f.AccountKey = {TEST_OPP_S1_UPDATE_ACC_ID}
+                  AND f.ProductKey = (SELECT ProductSK FROM DimProduct WHERE ProductID = {TEST_OPP_S1_UPDATE_PROD_ID} AND IsCurrent = TRUE) -- Lookup current ProductSK
+                  AND f.SalesAgentKey = {TEST_OPP_S1_UPDATE_AGENT_ID}
+                  AND f.DealStageKey = {TEST_OPP_S1_UPDATE_NEW_STAGE}
+                  AND f.CloseValue = {TEST_OPP_S1_UPDATE_NEW_VALUE};
                 """
                 res_fact_upd = hook_olap.get_first(sql_check_fact_upd)
-                logging.info(f"Check Updated Fact (OppID='{TEST_OPP_ID_S1_UPDATE}'): Result = {res_fact_upd}")
-                if not res_fact_upd or res_fact_upd[0] != 1 or res_fact_upd[1] != TEST_OPP_STAGE_S1_NEW or res_fact_upd[2] != TEST_OPP_VALUE_S1_NEW:
-                    logging.warning(f"Verification FAILED: Updated fact check failed. Expected Count=1, Stage={TEST_OPP_STAGE_S1_NEW}, Value={TEST_OPP_VALUE_S1_NEW}")
+                logging.info(f"Check Updated Fact (Keys for OppID='{TEST_OPP_ID_S1_UPDATE}', New Stage/Value): Count = {res_fact_upd[0] if res_fact_upd else 'Error'}")
+                if not res_fact_upd or res_fact_upd[0] < 1:
+                    logging.warning(f"Verification FAILED: Updated fact check failed. Expected at least one record with Stage={TEST_OPP_S1_UPDATE_NEW_STAGE}, Value={TEST_OPP_S1_UPDATE_NEW_VALUE} for related keys.")
 
             except Exception as e:
                 logging.error(f"Error during OLAP verification for Scenario 1: {e}")
             logging.info("--- Scenario 1: OLAP Verification Complete (Check Logs) ---")
 
-        @task(trigger_rule=TriggerRule.ALL_DONE) # Run cleanup regardless of verification status
-        def cleanup_oltp_s1(modify_task_output: dict): # Get output from modify task via XComs
+        @task(trigger_rule=TriggerRule.ALL_DONE)
+        def cleanup_oltp_s1(modify_task_output: dict):
             """Reverts changes made in OLTP for Scenario 1."""
             hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
-            new_opp_id = modify_task_output.get("new_opp_id") # Get the generated Opp ID
-            original_data = modify_task_output # The whole dict is the original data context
+            new_opp_id = modify_task_output.get("new_opp_id")
+            original_data = modify_task_output
             logging.info("--- Scenario 1: Cleaning Up OLTP Data ---")
             try:
-                # Delete new SalesPipeline record
-                if new_opp_id:
-                    sql_delete_opp_new = f"DELETE FROM SalesPipeline WHERE OpportunityID = '{new_opp_id}'"
-                    logging.info(f"Deleting OppID {new_opp_id}...")
-                    hook_oltp.run(sql_delete_opp_new)
-                else: logging.warning("Skipping delete for new OppID as it wasn't captured.")
-
-                # Revert updated SalesPipeline record
-                if original_data.get("original_opp_stage_id") is not None and original_data.get("original_opp_close_value") is not None:
-                    sql_revert_opp = f"""UPDATE SalesPipeline SET DealStageID = {original_data['original_opp_stage_id']}, CloseValue = {original_data['original_opp_close_value']}, updated_at = NOW() WHERE OpportunityID = '{TEST_OPP_ID_S1_UPDATE}';"""
-                    logging.info(f"Reverting OppID {TEST_OPP_ID_S1_UPDATE}...")
-                    hook_oltp.run(sql_revert_opp)
-                else: logging.warning(f"Skipping revert for OppID {TEST_OPP_ID_S1_UPDATE} (missing original data).")
-
-                # Revert updated SalesAgent record
-                if original_data.get("original_agent_manager_id") is not None:
-                    sql_revert_agent = f"""UPDATE SalesAgents SET ManagerID = {original_data['original_agent_manager_id']}, updated_at = NOW() WHERE SalesAgentID = {TEST_AGENT_ID_S1};"""
-                    logging.info(f"Reverting SalesAgentID {TEST_AGENT_ID_S1}...")
-                    hook_oltp.run(sql_revert_agent)
-                else: logging.warning(f"Skipping revert for SalesAgentID {TEST_AGENT_ID_S1} (missing original data).")
-
-                # Delete new Account record using the known test ID
-                sql_delete_acc = f"DELETE FROM Accounts WHERE AccountID = {TEST_ACC_ID_S1_NEW}"
-                logging.info(f"Deleting AccountID {TEST_ACC_ID_S1_NEW}...")
-                hook_oltp.run(sql_delete_acc)
-
+                if new_opp_id: hook_oltp.run(f"DELETE FROM SalesPipeline WHERE OpportunityID = '{new_opp_id}'"); logging.info(f"Deleted OppID {new_opp_id}")
+                else: logging.warning("Skipping delete for new OppID.")
+                if original_data.get("original_opp_stage_id") is not None: hook_oltp.run(f"""UPDATE SalesPipeline SET DealStageID = %s, CloseValue = %s, updated_at = NOW() WHERE OpportunityID = %s;""", parameters=(original_data['original_opp_stage_id'], original_data['original_opp_close_value'], TEST_OPP_ID_S1_UPDATE)); logging.info(f"Reverted OppID {TEST_OPP_ID_S1_UPDATE}")
+                else: logging.warning(f"Skipping revert for OppID {TEST_OPP_ID_S1_UPDATE}.")
+                if original_data.get("original_agent_manager_id") is not None: hook_oltp.run(f"""UPDATE SalesAgents SET ManagerID = %s, updated_at = NOW() WHERE SalesAgentID = %s;""", parameters=(original_data['original_agent_manager_id'], TEST_AGENT_ID_S1)); logging.info(f"Reverted SalesAgentID {TEST_AGENT_ID_S1}")
+                else: logging.warning(f"Skipping revert for SalesAgentID {TEST_AGENT_ID_S1}.")
+                hook_oltp.run(f"DELETE FROM Accounts WHERE AccountID = {TEST_ACC_ID_S1_NEW}"); logging.info(f"Deleted AccountID {TEST_ACC_ID_S1_NEW}")
                 logging.info("--- Scenario 1: OLTP Cleanup Complete ---")
-            except Exception as e:
-                logging.error(f"Error during OLTP cleanup for Scenario 1: {e}")
+            except Exception as e: logging.error(f"Error during OLTP cleanup S1: {e}")
 
         # Define flow for Scenario 1
         modify_oltp_task = modify_oltp_s1()
         verify_olap_task = verify_olap_s1()
-        cleanup_oltp_task = cleanup_oltp_s1(modify_oltp_task) # Pass XCom implicitly
-
+        cleanup_oltp_task = cleanup_oltp_s1(modify_oltp_task)
         modify_oltp_task >> trigger_incremental_s1 >> verify_olap_task >> cleanup_oltp_task
 
     # --- Scenario 2 Group ---
@@ -233,32 +189,24 @@ def b2b_etl_test_scenarios_dag():
         def modify_oltp_s2() -> dict:
             """Applies data modifications in OLTP for Scenario 2 (Product SCD2)."""
             hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
-            original_product_data = None
             logging.info("--- Scenario 2: Modifying OLTP Data ---")
             try:
                 original_product_data = hook_oltp.get_first(f"SELECT ProductName, SalesPrice FROM Products WHERE ProductID = {TEST_PROD_ID_S2}")
-                if not original_product_data:
-                    logging.error(f"Cannot run Scenario 2: ProductID {TEST_PROD_ID_S2} not found in OLTP.")
-                    raise AirflowSkipException(f"ProductID {TEST_PROD_ID_S2} not found.")
-                new_name = original_product_data[0].replace(TEST_PROD_NAME_S2_SUFFIX, '') + TEST_PROD_NAME_S2_SUFFIX # Avoid appending suffix multiple times
+                if not original_product_data: raise AirflowSkipException(f"ProductID {TEST_PROD_ID_S2} not found.")
+                new_name = original_product_data[0].replace(TEST_PROD_NAME_S2_SUFFIX, '') + TEST_PROD_NAME_S2_SUFFIX
                 sql_update_prod = f"""UPDATE Products SET SalesPrice = SalesPrice * {TEST_PROD_PRICE_MULTIPLIER_S2}, ProductName = %s, updated_at = NOW() WHERE ProductID = %s;"""
                 logging.info(f"Updating ProductID {TEST_PROD_ID_S2}...")
                 hook_oltp.run(sql_update_prod, parameters=(new_name, TEST_PROD_ID_S2))
                 logging.info("--- Scenario 2: OLTP Modifications Complete ---")
                 return {"original_product_name": original_product_data[0], "original_product_price": original_product_data[1]}
-            except Exception as e: logging.error(f"Error modifying OLTP data for Scenario 2: {e}"); raise
+            except Exception as e: logging.error(f"Error modifying OLTP S2: {e}"); raise
 
-        # Define Trigger Operator at the DAG level within the group
         trigger_incremental_s2 = TriggerDagRunOperator(
             task_id="trigger_incremental_load_s2",
             trigger_dag_id=INCREMENTAL_DAG_ID,
-            conf={"triggered_by_test": "scenario_2", "run_id": f"test_s2_{{{{ dag_run.id }}}}"}, # Use current dag_run.id
-            wait_for_completion=True, # Wait for the triggered DAG to finish
-            poke_interval=30,
-            # timeout=1800,           # REMOVED INVALID ARGUMENT
-            allowed_states=[State.SUCCESS], # USES IMPORTED State
-            # Corrected: Use only valid DagRunState values
-            failed_states=[State.FAILED]
+            conf={"triggered_by_test": "scenario_2", "run_id": f"test_s2_{{{{ dag_run.id }}}}"},
+            wait_for_completion=True, poke_interval=30,
+            allowed_states=[State.SUCCESS], failed_states=[State.FAILED]
         )
 
         @task
@@ -267,14 +215,23 @@ def b2b_etl_test_scenarios_dag():
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
             logging.info("--- Scenario 2: Verifying OLAP Data (DimProduct SCD2) ---")
             try:
-                sql_check_prod = f"""SELECT ProductID, ProductName, SalesPrice, ValidFrom, ValidTo, IsCurrent FROM DimProduct WHERE ProductID = {TEST_PROD_ID_S2} ORDER BY ValidFrom DESC;"""
+                # Corrected column name from SalesPrice to Price
+                sql_check_prod = f"""SELECT ProductID, ProductName, Price, ValidFrom, ValidTo, IsCurrent FROM DimProduct WHERE ProductID = {TEST_PROD_ID_S2} ORDER BY ValidFrom DESC;"""
                 res_prod = hook_olap.get_records(sql_check_prod)
                 logging.info(f"Check Product History (ID={TEST_PROD_ID_S2}):\n{json.dumps(res_prod, indent=2, default=str)}")
                 if len(res_prod) < 2: logging.warning("Verification FAILED: Expected at least 2 versions for Product, found less.")
                 elif not res_prod[0][5]: logging.warning("Verification FAILED: Expected latest version for Product to be IsCurrent=TRUE.")
-                elif len(res_prod) > 1 and res_prod[1][5]: logging.warning("Verification FAILED: Expected previous version for Product to be IsCurrent=FALSE.") # Check index exists before accessing
-                elif len(res_prod) > 1 and not res_prod[1][4]: logging.warning("Verification FAILED: Expected previous version for Product to have a ValidTo date.") # Check index exists
-            except Exception as e: logging.error(f"Error during OLAP verification for Scenario 2: {e}")
+                elif len(res_prod) > 1 and res_prod[1][5]: logging.warning("Verification FAILED: Expected previous version for Product to be IsCurrent=FALSE.")
+                elif len(res_prod) > 1 and not res_prod[1][4]: logging.warning("Verification FAILED: Expected previous version for Product to have a ValidTo date.")
+            except Exception as e:
+                # Check if error is due to missing 'Price' column
+                if psycopg2 and isinstance(e, psycopg2.errors.UndefinedColumn) and "price" in str(e).lower() and "salesprice" not in str(e).lower():
+                     logging.error(f"Hint: Verification failed because column 'Price' might not exist in DimProduct. Check schema and initial/incremental load DAGs.")
+                # Check if error is due to originally trying 'SalesPrice'
+                elif psycopg2 and isinstance(e, psycopg2.errors.UndefinedColumn) and "salesprice" in str(e).lower():
+                     logging.error(f"Hint: Verification failed because column 'SalesPrice' does not exist. The query was updated to use 'Price'. Check DimProduct schema.")
+                else:
+                     logging.error(f"Error during OLAP verification for Scenario 2: {e}")
             logging.info("--- Scenario 2: OLAP Verification Complete (Check Logs) ---")
 
         @task(trigger_rule=TriggerRule.ALL_DONE)
@@ -286,18 +243,16 @@ def b2b_etl_test_scenarios_dag():
                  logging.warning(f"Skipping cleanup for ProductID {TEST_PROD_ID_S2} due to missing original data.")
                  return
             try:
-                # Use parameters to avoid SQL injection issues with names
                 sql_revert_prod = f"""UPDATE Products SET ProductName = %s, SalesPrice = %s, updated_at = NOW() WHERE ProductID = %s;"""
                 logging.info(f"Reverting ProductID {TEST_PROD_ID_S2}...")
                 hook_oltp.run(sql_revert_prod, parameters=(original_data['original_product_name'], original_data['original_product_price'], TEST_PROD_ID_S2))
                 logging.info("--- Scenario 2: OLTP Cleanup Complete ---")
-            except Exception as e: logging.error(f"Error during OLTP cleanup for Scenario 2: {e}")
+            except Exception as e: logging.error(f"Error during OLTP cleanup S2: {e}")
 
         # Define flow for Scenario 2
         modify_oltp_task_s2 = modify_oltp_s2()
         verify_olap_task_s2 = verify_olap_s2()
-        cleanup_oltp_task_s2 = cleanup_oltp_s2(modify_oltp_task_s2) # Pass XCom implicitly
-
+        cleanup_oltp_task_s2 = cleanup_oltp_s2(modify_oltp_task_s2)
         modify_oltp_task_s2 >> trigger_incremental_s2 >> verify_olap_task_s2 >> cleanup_oltp_task_s2
 
     # Define overall DAG flow
