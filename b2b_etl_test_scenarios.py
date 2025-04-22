@@ -46,7 +46,7 @@ TEST_PROD_PRICE_MULTIPLIER_S2 = 1.1
     default_args={'owner': 'airflow', 'retries': 0}, # No retries for tests
     tags=['b2b_sales', 'test', 'etl'],
     doc_md="""
-    ### ETL Test Scenarios DAG (Fixed Trigger Operator Args)
+    ### ETL Test Scenarios DAG (Fixed State Args)
 
     Automates running test scenarios described previously.
     Triggers the incremental load DAG and waits for it to complete.
@@ -73,7 +73,8 @@ def b2b_etl_test_scenarios_dag():
             original_opp_data = None
             # Generate unique Opp ID for this run using Airflow context
             ti = context['ti'] # Get task instance from context
-            new_opp_id_s1 = f'TEST_INC_NEW_{ti.dag_run.id}' # Use dag_run.id for uniqueness
+            # Use a simpler unique ID for testing if dag_run.id is complex/long
+            new_opp_id_s1 = f'TEST_S1_{ti.run_id[-8:]}' # Use last 8 chars of run_id
 
             logging.info("--- Scenario 1: Modifying OLTP Data ---")
             try:
@@ -136,7 +137,8 @@ def b2b_etl_test_scenarios_dag():
             poke_interval=30,         # How often to check status
             # timeout=1800,           # REMOVED INVALID ARGUMENT
             allowed_states=[State.SUCCESS], # Required state
-            failed_states=[State.FAILED, State.UPSTREAM_FAILED] # States that cause this task to fail
+            # Corrected: Use only valid DagRunState values
+            failed_states=[State.FAILED]
         )
 
         @task
@@ -255,7 +257,8 @@ def b2b_etl_test_scenarios_dag():
             poke_interval=30,
             # timeout=1800,           # REMOVED INVALID ARGUMENT
             allowed_states=[State.SUCCESS], # USES IMPORTED State
-            failed_states=[State.FAILED, State.UPSTREAM_FAILED] # USES IMPORTED State
+            # Corrected: Use only valid DagRunState values
+            failed_states=[State.FAILED]
         )
 
         @task
