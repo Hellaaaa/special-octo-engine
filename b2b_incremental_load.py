@@ -91,7 +91,7 @@ def b2b_incremental_load_dag():
     # --- Task 1: Dimension - Account (Incremental Update - SCD Type 1 - Upsert) ---
     @task
     def update_dim_account(**context):
-        table_key = 'accounts'
+        table_key = 'accounts' # Key for OLTP table and watermark
         start_time_str = get_watermark(table_key)
         end_time = pendulum.now('UTC')
         end_time_iso = end_time.isoformat()
@@ -144,6 +144,9 @@ def b2b_incremental_load_dag():
             set_watermark(table_key, end_time_iso) # Update watermark on success
         except Exception as e:
             logging.error(f"Error during Upsert into DimAccount (SCD1): {e}")
+            # Check if error is related to missing SCD2 columns (should not happen now)
+            if psycopg2 and isinstance(e, psycopg2.errors.UndefinedColumn) and ("iscurrent" in str(e) or "validto" in str(e) or "validfrom" in str(e)):
+                 logging.error(f"Hint: SCD2 columns should not be present or used in DimAccount for SCD1 logic.")
             raise # Fail task if upsert fails
 
     # --- Task 2: Dimension - Product (Incremental Update - SCD Type 2) ---
@@ -204,7 +207,7 @@ def b2b_incremental_load_dag():
         except Exception as e:
             # Check for specific error related to missing SCD2 columns
             if psycopg2 and isinstance(e, psycopg2.errors.UndefinedColumn) and ("iscurrent" in str(e) or "validto" in str(e) or "validfrom" in str(e)):
-                 logging.error(f"Hint: Ensure columns 'ValidFrom', 'ValidTo', 'IsCurrent' exist in OLAP table 'DimProduct'.")
+                 logging.error(f"Hint: Ensure columns 'ValidFrom', 'ValidTo', 'IsCurrent' exist in OLAP table 'DimProduct'. Check SQL script 'add_scd2_columns_olap_sql'.")
             logging.error(f"Error during SCD Type 2 for DimProduct: {e}"); raise
 
     # --- Task 3: Dimension - SalesAgent (Incremental Update - SCD Type 1 - Upsert) ---
@@ -237,7 +240,7 @@ def b2b_incremental_load_dag():
 
         hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
         try:
-            # Use insert_rows with replace=True for SCD Type 1 Upsert
+             # Use insert_rows with replace=True for SCD Type 1 Upsert
             hook_olap.insert_rows(
                 table="DimSalesAgent", rows=olap_data, target_fields=target_fields,
                 commit_every=1000, replace=True, replace_index="SalesAgentID"
@@ -246,6 +249,8 @@ def b2b_incremental_load_dag():
             set_watermark(table_key, end_time_iso)
         except Exception as e:
             logging.error(f"Error during Upsert into DimSalesAgent (SCD1): {e}")
+            if psycopg2 and isinstance(e, psycopg2.errors.UndefinedColumn) and ("iscurrent" in str(e) or "validto" in str(e) or "validfrom" in str(e)):
+                 logging.error(f"Hint: SCD2 columns should not be present or used in DimSalesAgent for SCD1 logic.")
             raise
 
     # --- Task 4: Fact Table - SalesPerformance (Incremental Load/Update - UPSERT) ---
@@ -282,11 +287,11 @@ def b2b_incremental_load_dag():
 
                 # --- Dimension Key Lookups ---
                 date_key_result = hook_olap.get_first("SELECT DateKey FROM DimDate WHERE Date = %s", parameters=(event_date_str,))
-                # AccountKey (SCD1 - direct lookup, no date needed)
+                # AccountKey (SCD1 - direct lookup)
                 account_key_result = hook_olap.get_first("SELECT AccountID FROM DimAccount WHERE AccountID = %s", parameters=(oltp_account_id,))
                 # ProductKey (SCD2 - lookup based on event date)
                 product_key_result = hook_olap.get_first("SELECT ProductID FROM DimProduct WHERE ProductID = %s AND %s >= ValidFrom AND (%s < ValidTo OR ValidTo IS NULL)", parameters=(oltp_product_id, event_date_str, event_date_str))
-                # SalesAgentKey (SCD1 - direct lookup, no date needed)
+                # SalesAgentKey (SCD1 - direct lookup)
                 agent_key_result = hook_olap.get_first("SELECT SalesAgentID FROM DimSalesAgent WHERE SalesAgentID = %s", parameters=(oltp_sales_agent_id,))
                 # DealStageKey (Static)
                 stage_key_result = hook_olap.get_first("SELECT StageID FROM DimDealStage WHERE StageID = %s", parameters=(oltp_deal_stage_id,))
