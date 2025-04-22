@@ -4,12 +4,12 @@ import logging
 from datetime import timedelta
 import json # To handle configuration passing for TriggerDagRunOperator
 
+# Import necessary Airflow components
 from airflow.decorators import dag, task, task_group
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-# Removed: from airflow.sensors.external_task import ExternalTaskSensor
-from airflow.utils.state import State # <-- ADDED IMPORT
+from airflow.utils.state import State # Required for allowed_states/failed_states
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.exceptions import AirflowSkipException
 
@@ -25,7 +25,8 @@ TEST_AGENT_ID_S1 = 5
 # TEST_AGENT_REGION_S1_ORIG = 'Original Region S1' # Placeholder - Not used in current logic
 TEST_AGENT_MANAGER_ID_S1_ORIG = 1 # Placeholder - Get the actual original value if needed for complex revert
 TEST_AGENT_MANAGER_ID_S1_NEW = 5 # As per scenario
-TEST_OPP_ID_S1_NEW = f'TEST_INC_NEW_{{{{ ts_nodash }}}}' # Make new OppID unique per run
+# Generate unique Opp ID based on the test DAG run's ID
+TEST_OPP_ID_S1_NEW = f'TEST_INC_NEW_{{{{ dag_run.id }}}}'
 TEST_OPP_ID_S1_UPDATE = 'SBCR987L' # Existing OpportunityID to update
 TEST_OPP_STAGE_S1_ORIG = 1 # Placeholder - Get the actual original value if needed for complex revert
 TEST_OPP_STAGE_S1_NEW = 4 # As per scenario
@@ -45,7 +46,7 @@ TEST_PROD_PRICE_MULTIPLIER_S2 = 1.1
     default_args={'owner': 'airflow', 'retries': 0}, # No retries for tests
     tags=['b2b_sales', 'test', 'etl'],
     doc_md="""
-    ### ETL Test Scenarios DAG (Fixed Errors)
+    ### ETL Test Scenarios DAG (Fixed Trigger Operator Args)
 
     Automates running test scenarios described previously.
     Triggers the incremental load DAG and waits for it to complete.
@@ -65,12 +66,12 @@ def b2b_etl_test_scenarios_dag():
     @task_group(group_id='scenario_1_incremental_update')
     def scenario_1_group():
         @task
-        def modify_oltp_s1() -> dict:
+        def modify_oltp_s1(**context) -> dict: # Added context to access ti
             """Applies data modifications in OLTP for Scenario 1."""
             hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
             original_agent_data = None
             original_opp_data = None
-            # Generate unique Opp ID for this run using Airflow macro
+            # Generate unique Opp ID for this run using Airflow context
             ti = context['ti'] # Get task instance from context
             new_opp_id_s1 = f'TEST_INC_NEW_{ti.dag_run.id}' # Use dag_run.id for uniqueness
 
@@ -133,19 +134,16 @@ def b2b_etl_test_scenarios_dag():
             conf={"triggered_by_test": "scenario_1", "run_id": f"test_s1_{{{{ dag_run.id }}}}"}, # Use current dag_run.id for uniqueness
             wait_for_completion=True, # Wait for the triggered DAG to finish
             poke_interval=30,         # How often to check status
-            timeout=1800,             # Timeout for waiting (30 mins)
-            allowed_states=[State.SUCCESS], # Required state - USES IMPORTED State
-            failed_states=[State.FAILED, State.UPSTREAM_FAILED] # States that cause this task to fail - USES IMPORTED State
+            # timeout=1800,           # REMOVED INVALID ARGUMENT
+            allowed_states=[State.SUCCESS], # Required state
+            failed_states=[State.FAILED, State.UPSTREAM_FAILED] # States that cause this task to fail
         )
 
         @task
         def verify_olap_s1():
             """Runs verification queries against OLAP after incremental load for Scenario 1."""
-            # This task now runs *after* the TriggerDagRunOperator has confirmed success
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
             logging.info("--- Scenario 1: Verifying OLAP Data ---")
-            # ... (Verification SQL queries remain the same as previous version) ...
-            # Example checks:
             try:
                 # 1. Check new Account
                 sql_check_acc = f"SELECT AccountID, AccountName FROM DimAccount WHERE AccountID = {TEST_ACC_ID_S1_NEW}"
@@ -155,14 +153,12 @@ def b2b_etl_test_scenarios_dag():
 
                 # 2. Check updated Agent (assuming SCD1 / UPSERT)
                 sql_check_agent = f"SELECT SalesAgentID, ManagerName FROM DimSalesAgent WHERE SalesAgentID = {TEST_AGENT_ID_S1}"
-                res_agent = hook_olap.get_first(sql_check_agent) # Use get_first for single expected row
+                res_agent = hook_olap.get_first(sql_check_agent)
                 logging.info(f"Check Updated Agent (ID={TEST_AGENT_ID_S1}): {res_agent}")
-                # Note: ManagerName lookup depends on DimSalesManager existing and being joined correctly in incremental DAG
-                # if not res_agent or res_agent[1] != EXPECTED_MANAGER_NAME: logging.warning("Verification FAILED: Agent update incorrect.")
+                # Add specific check if ManagerName is expected to change and DimSalesManager exists
+                # if not res_agent or res_agent[1] != EXPECTED_MANAGER_NAME_AFTER_UPDATE: logging.warning("Verification FAILED: Agent update incorrect.")
 
                 # 3. Check new Fact record (basic check)
-                # Need to lookup keys first based on TEST_OPP_ID_S1_NEW's data
-                # Example: Check if a fact exists with the new account key
                 sql_check_fact_new = f"SELECT COUNT(*) FROM FactSalesPerformance WHERE AccountKey = {TEST_ACC_ID_S1_NEW}"
                 res_fact_new = hook_olap.get_first(sql_check_fact_new)
                 logging.info(f"Check New Fact (AccountKey={TEST_ACC_ID_S1_NEW}): Count = {res_fact_new[0] if res_fact_new else 'Error'}")
@@ -196,8 +192,7 @@ def b2b_etl_test_scenarios_dag():
                     sql_delete_opp_new = f"DELETE FROM SalesPipeline WHERE OpportunityID = '{new_opp_id}'"
                     logging.info(f"Deleting OppID {new_opp_id}...")
                     hook_oltp.run(sql_delete_opp_new)
-                else:
-                    logging.warning("Skipping delete for new OppID as it wasn't captured.")
+                else: logging.warning("Skipping delete for new OppID as it wasn't captured.")
 
                 # Revert updated SalesPipeline record
                 if original_data.get("original_opp_stage_id") is not None and original_data.get("original_opp_close_value") is not None:
@@ -221,7 +216,6 @@ def b2b_etl_test_scenarios_dag():
                 logging.info("--- Scenario 1: OLTP Cleanup Complete ---")
             except Exception as e:
                 logging.error(f"Error during OLTP cleanup for Scenario 1: {e}")
-                # Do not fail the DAG
 
         # Define flow for Scenario 1
         modify_oltp_task = modify_oltp_s1()
@@ -259,7 +253,7 @@ def b2b_etl_test_scenarios_dag():
             conf={"triggered_by_test": "scenario_2", "run_id": f"test_s2_{{{{ dag_run.id }}}}"}, # Use current dag_run.id
             wait_for_completion=True, # Wait for the triggered DAG to finish
             poke_interval=30,
-            timeout=1800,
+            # timeout=1800,           # REMOVED INVALID ARGUMENT
             allowed_states=[State.SUCCESS], # USES IMPORTED State
             failed_states=[State.FAILED, State.UPSTREAM_FAILED] # USES IMPORTED State
         )
