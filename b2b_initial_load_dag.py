@@ -182,10 +182,28 @@ def b2b_initial_load_dag():
             sql_extract = """SELECT a.AccountID, a.AccountName, s.SectorName, CASE WHEN a.Revenue < 1000000 THEN 'Under 1M' WHEN a.Revenue BETWEEN 1000000 AND 10000000 THEN '1M-10M' WHEN a.Revenue > 10000000 THEN 'Over 10M' ELSE 'Unknown' END, a.ParentAccountID FROM Accounts a LEFT JOIN Sectors s ON a.SectorID = s.SectorID ORDER BY a.AccountID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
-            olap_data = [(row[0], row[1], row[2], row[3], row[4]) for row in source_data]; target_fields = ["accountid", "accountname", "sector", "revenuerange", "parentaccountid"]
+            olap_data = [(row[0], row[1], row[2], row[3], row[4]) for row in source_data]
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-            try: hook_olap.insert_rows(table="dimaccount", rows=olap_data, target_fields=target_fields, commit_every=batch_size); rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
-            except Exception as e: logging.error(f"Failed DimAccount batch {current_offset}: {e}"); raise AirflowSkipException() from e
+            try:
+                for record in olap_data:
+                    hook_olap.run(
+                        """
+                        INSERT INTO dimaccount (accountid, accountname, sector, revenuerange, parentaccountid)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (accountid) DO UPDATE SET
+                          accountname = EXCLUDED.accountname,
+                          sector = EXCLUDED.sector,
+                          revenuerange = EXCLUDED.revenuerange,
+                          parentaccountid = EXCLUDED.parentaccountid;
+                        """,
+                        parameters=record
+                    )
+                rows_loaded = len(olap_data)
+                total_rows_processed += rows_loaded
+                set_batch_state(variable_name, current_offset + rows_loaded)
+            except Exception as e:
+                logging.error(f"Failed DimAccount batch {current_offset}: {e}")
+                raise AirflowSkipException() from e
             if len(source_data) < batch_size: break
         logging.info(f"Finished loading dimaccount (SCD1). Total: {total_rows_processed}")
     @task
@@ -197,10 +215,31 @@ def b2b_initial_load_dag():
             sql_extract = """SELECT p.ProductID, p.ProductName, ps.SeriesName, p.SalesPrice, CASE WHEN p.SalesPrice < 100 THEN 'Low' WHEN p.SalesPrice BETWEEN 100 AND 1000 THEN 'Medium' WHEN p.SalesPrice > 1000 THEN 'High' ELSE 'Unknown' END FROM Products p LEFT JOIN ProductSeries ps ON p.SeriesID = ps.SeriesID ORDER BY p.ProductID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
-            olap_data = [(row[0], row[1], row[2], row[3], row[4], initial_valid_from, None, True) for row in source_data]; target_fields = ["productid", "productname", "seriesname", "price", "pricerange", "validfrom", "validto", "iscurrent"]
+            olap_data = [(row[0], row[1], row[2], row[3], row[4], initial_valid_from, None, True) for row in source_data]
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-            try: hook_olap.insert_rows(table="dimproduct", rows=olap_data, target_fields=target_fields, commit_every=batch_size); rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
-            except Exception as e: logging.error(f"Failed dimproduct batch {current_offset}: {e}"); raise AirflowSkipException() from e
+            try:
+                for record in olap_data:
+                    hook_olap.run(
+                        """
+                        INSERT INTO dimproduct (productid, productname, seriesname, price, pricerange, validfrom, validto, iscurrent)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (productid) DO UPDATE SET
+                          productname = EXCLUDED.productname,
+                          seriesname = EXCLUDED.seriesname,
+                          price = EXCLUDED.price,
+                          pricerange = EXCLUDED.pricerange,
+                          validfrom = EXCLUDED.validfrom,
+                          validto = EXCLUDED.validto,
+                          iscurrent = EXCLUDED.iscurrent;
+                        """,
+                        parameters=record
+                    )
+                rows_loaded = len(olap_data)
+                total_rows_processed += rows_loaded
+                set_batch_state(variable_name, current_offset + rows_loaded)
+            except Exception as e:
+                logging.error(f"Failed dimproduct batch {current_offset}: {e}")
+                raise AirflowSkipException() from e
             if len(source_data) < batch_size: break
         logging.info(f"Finished loading dimproduct (SCD2). Total: {total_rows_processed}")
     @task
@@ -211,10 +250,27 @@ def b2b_initial_load_dag():
             sql_extract = """SELECT sa.SalesAgentID, sa.SalesAgentName, sm.ManagerName, l.LocationName AS Region FROM SalesAgents sa LEFT JOIN SalesManagers sm ON sa.ManagerID = sm.ManagerID LEFT JOIN Locations l ON sa.RegionalOfficeID = l.LocationID ORDER BY sa.SalesAgentID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
-            olap_data = [(row[0], row[1], row[2], row[3]) for row in source_data]; target_fields = ["salesagentid", "salesagentname", "managername", "region"]
+            olap_data = [(row[0], row[1], row[2], row[3]) for row in source_data]
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-            try: hook_olap.insert_rows(table="dimsalesagent", rows=olap_data, target_fields=target_fields, commit_every=batch_size); rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
-            except Exception as e: logging.error(f"Failed dimsalesagent batch {current_offset}: {e}"); raise AirflowSkipException() from e
+            try:
+                for record in olap_data:
+                    hook_olap.run(
+                        """
+                        INSERT INTO dimsalesagent (salesagentid, salesagentname, managername, region)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (salesagentid) DO UPDATE SET
+                          salesagentname = EXCLUDED.salesagentname,
+                          managername = EXCLUDED.managername,
+                          region = EXCLUDED.region;
+                        """,
+                        parameters=record
+                    )
+                rows_loaded = len(olap_data)
+                total_rows_processed += rows_loaded
+                set_batch_state(variable_name, current_offset + rows_loaded)
+            except Exception as e:
+                logging.error(f"Failed dimsalesagent batch {current_offset}: {e}")
+                raise AirflowSkipException() from e
             if len(source_data) < batch_size: break
         logging.info(f"Finished loading dimsalesagent (SCD1). Total: {total_rows_processed}")
 
