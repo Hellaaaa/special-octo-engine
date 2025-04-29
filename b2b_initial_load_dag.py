@@ -148,10 +148,32 @@ def b2b_initial_load_dag():
         logging.info("Populating dimdate..."); hook_olap.run(sql_insert_dates); logging.info("dimdate populated.")
     @task
     def load_dim_deal_stage():
-        hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID); hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-        stages = hook_oltp.get_records("SELECT DealStageID, StageName FROM DealStages")
-        # Use lowercase, unquoted identifiers
-        if stages: hook_olap.insert_rows(table="dimdealstage", rows=stages, target_fields=["stageid", "stagename"], commit_every=DEFAULT_BATCH_SIZE); logging.info(f"Loaded {len(stages)} rows into dimdealstage.")
+        """Loads the static dimdealstage dimension table."""
+        hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
+        hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
+        try:
+            stages = hook_oltp.get_records("SELECT DealStageID, StageName FROM DealStages")
+            # Deduplicate by StageID
+            unique_stages = {}
+            for sid, name in stages:
+                unique_stages[sid] = name
+            stages = [(sid, unique_stages[sid]) for sid in unique_stages]
+            if stages:
+                for sid, name in stages:
+                    hook_olap.run(
+                        """
+                        INSERT INTO dimdealstage (stageid, stagename)
+                        VALUES (%s, %s)
+                        ON CONFLICT (stageid) DO UPDATE SET stagename = EXCLUDED.stagename;
+                        """,
+                        parameters=(sid, name)
+                    )
+                logging.info(f"Upserted {len(stages)} rows into dimdealstage.")
+            else:
+                logging.info("No stages found in OLTP DealStages table.")
+        except Exception as e:
+            logging.error(f"Failed to load dimdealstage: {e}")
+            raise
     @task
     def load_dim_account(): # SCD1
         variable_name = "initial_load_dim_account_offset"; batch_size = DEFAULT_BATCH_SIZE; total_rows_processed = 0
