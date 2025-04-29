@@ -302,7 +302,9 @@ def b2b_initial_load_dag():
             for row in source_data:
                 try:
                     opportunity_id, oltp_sales_agent_id, oltp_product_id, oltp_account_id, oltp_deal_stage_id, _, _, close_value, duration_days, expected_success_rate, event_date = row
-                    event_date_str = pendulum.instance(event_date).to_date_string()
+                    # Ensure event_date (which may be a str) is parsed into a Pendulum date
+                    event_date_dt = pendulum.parse(str(event_date))
+                    event_date_str = event_date_dt.to_date_string()
                     # Lookups: Use lowercase, unquoted identifiers for OLAP tables/columns
                     date_key_res = hook_olap.get_first('SELECT datekey FROM dimdate WHERE date = %s', parameters=(event_date_str,))
                     account_key_res = hook_olap.get_first('SELECT accountid FROM dimaccount WHERE accountid = %s', parameters=(oltp_account_id,))
