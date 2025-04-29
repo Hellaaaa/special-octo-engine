@@ -59,12 +59,13 @@ def reset_batch_state(variable_name):
     default_args={'retry_delay': timedelta(minutes=2)}, # Keep retry delay
     tags=['b2b_sales', 'initial_load', 'repopulatable', 'refined', 'scd2_product_only'],
     doc_md="""
-    ### B2B Sales Initial Load DAG (Fixed datetime Import)
+    ### B2B Sales Initial Load DAG (Fact Load ON CONFLICT)
 
     Performs the initial population of the OLAP database from the OLTP source.
     **TRUNCATES target tables (with CASCADE). Uses lowercase unquoted identifiers qualified with the schema.**
     **Implements SCD Type 2 logic ONLY for dimproduct during initial load.**
     **dimaccount and dimsalesagent are loaded using explicit UPSERT (SCD Type 1).**
+    **factsalesperformance loaded using INSERT ON CONFLICT DO NOTHING to handle potential source duplicates.**
     Resets timestamp-based watermarks for the incremental load DAG at the end.
     **Looks up productsk for factsalesperformance.productkey.**
 
@@ -209,7 +210,7 @@ def b2b_initial_load_dag():
     # --- Task: Fact Table - SalesPerformance (Initial Load) ---
     @task
     def load_fact_sales_performance():
-        """Loads factsalesperformance, looking up appropriate dimension keys (using productsk)."""
+        """Loads factsalesperformance using INSERT ON CONFLICT DO NOTHING."""
         variable_name = "initial_load_fact_sales_perf_offset"; batch_size = DEFAULT_BATCH_SIZE; total_rows_processed = 0
         hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID); hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
         while True:
@@ -218,17 +219,12 @@ def b2b_initial_load_dag():
             try: source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             except Exception as e: logging.error(f"Failed fetch SalesPipeline offset {current_offset}: {e}"); raise AirflowSkipException() from e
             if not source_data: break
-            olap_data_to_insert = []; missing_keys_count = 0
+            olap_data_to_insert = []; missing_keys_count = 0; processed_in_batch = 0
             for row in source_data:
                 try:
                     opportunity_id, oltp_sales_agent_id, oltp_product_id, oltp_account_id, oltp_deal_stage_id, _, _, close_value, duration_days, expected_success_rate, event_date = row
-                    # ** CORRECTED DATE HANDLING **
-                    if isinstance(event_date, (datetime, date)):
-                        event_date_str = event_date.strftime('%Y-%m-%d')
-                    else:
-                        event_date_str = pendulum.parse(str(event_date)).to_date_string()
-
-                    # Lookups: Use schema-qualified, lowercase, unquoted identifiers
+                    if isinstance(event_date, (datetime, date)): event_date_str = event_date.strftime('%Y-%m-%d')
+                    else: event_date_str = pendulum.parse(str(event_date)).to_date_string()
                     date_key_res = hook_olap.get_first(f'SELECT datekey FROM {OLAP_SCHEMA}.dimdate WHERE date = %s', parameters=(event_date_str,))
                     account_key_res = hook_olap.get_first(f'SELECT accountid FROM {OLAP_SCHEMA}.dimaccount WHERE accountid = %s', parameters=(oltp_account_id,))
                     product_sk_res = hook_olap.get_first(f'SELECT productsk FROM {OLAP_SCHEMA}.dimproduct WHERE productid = %s AND iscurrent = TRUE', parameters=(oltp_product_id,))
@@ -239,17 +235,31 @@ def b2b_initial_load_dag():
                     agent_key = agent_key_res[0] if agent_key_res else None; stage_key = stage_key_res[0] if stage_key_res else None
                     if all([date_key, account_key, product_key, agent_key, stage_key]):
                          olap_data_to_insert.append((opportunity_id, date_key, account_key, product_key, agent_key, stage_key, close_value, duration_days, expected_success_rate))
-                    else: missing_keys_count += 1; logging.warning(f"Initial Load: Skip OppID {opportunity_id} missing key for Event {event_date_str}. Found:[D:{date_key is not None},A:{account_key is not None},P:{product_key is not None},Ag:{agent_key is not None},S:{stage_key is not None}]")
-                except Exception as lookup_ex: missing_keys_count += 1; logging.error(f"Initial Load: Dim lookup error OppID {row[0]}: {lookup_ex}") # Log the actual exception
+                    else: missing_keys_count += 1; # logging.warning(f"Initial Load: Skip OppID {opportunity_id} missing key for Event {event_date_str}.") # Too verbose
+                except Exception as lookup_ex: missing_keys_count += 1; logging.error(f"Initial Load: Dim lookup error OppID {row[0]}: {lookup_ex}")
             if olap_data_to_insert:
                 try:
-                    target_fields = ["opportunityid", "datekey", "accountkey", "productkey", "salesagentkey", "dealstagekey", "closevalue", "durationdays", "expectedsuccessrate"]
-                    hook_olap.insert_rows(table=f"{OLAP_SCHEMA}.factsalesperformance", rows=olap_data_to_insert, target_fields=target_fields, commit_every=batch_size)
-                    rows_loaded = len(olap_data_to_insert); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + len(source_data))
+                    # ** MODIFIED: Use INSERT ON CONFLICT DO NOTHING row by row **
+                    with hook_olap.get_conn() as conn:
+                        with conn.cursor() as cur:
+                            insert_sql = f"""
+                            INSERT INTO {OLAP_SCHEMA}.factsalesperformance
+                            (opportunityid, datekey, accountkey, productkey, salesagentkey, dealstagekey, closevalue, durationdays, expectedsuccessrate)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (opportunityid) DO NOTHING;
+                            """
+                            # Execute one by one
+                            for record in olap_data_to_insert:
+                                cur.execute(insert_sql, record)
+                                processed_in_batch += 1 # Count successful attempts
+                        conn.commit()
+                    total_rows_processed += processed_in_batch
+                    set_batch_state(variable_name, current_offset + len(source_data)) # Advance offset by rows read
+                    logging.info(f"Processed batch offset {current_offset}. Attempted inserts: {len(olap_data_to_insert)}. Actual inserts/ignored: {processed_in_batch}. Total inserted so far: {total_rows_processed}")
                 except Exception as e: logging.error(f"Failed fact insert batch {current_offset}: {e}"); raise AirflowSkipException() from e
             else: set_batch_state(variable_name, current_offset + len(source_data)); logging.warning(f"No valid fact data in batch {current_offset}")
             if len(source_data) < batch_size: break
-        logging.info(f"Finished loading factsalesperformance. Inserted: {total_rows_processed}. Skipped: {missing_keys_count}")
+        logging.info(f"Finished loading factsalesperformance. Total rows processed/inserted: {total_rows_processed}. Skipped rows due to missing keys: {missing_keys_count}")
 
     # --- Task: Reset Incremental Timestamp Watermarks ---
     @task
