@@ -58,16 +58,16 @@ def reset_batch_state(variable_name):
     default_args={'retry_delay': timedelta(minutes=2)}, # Keep retry delay
     tags=['b2b_sales', 'initial_load', 'repopulatable', 'refined', 'scd2_product_only'],
     doc_md="""
-    ### B2B Sales Initial Load DAG (Reverted to Quoted Identifiers)
+    ### B2B Sales Initial Load DAG (Lowercase Identifiers)
 
     Performs the initial population of the OLAP database from the OLTP source.
-    **TRUNCATES target tables (with CASCADE). Uses double-quoted identifiers for OLAP table/column names.**
+    **TRUNCATES target tables (with CASCADE). Uses lowercase unquoted identifiers for OLAP table/column names.**
     **Implements SCD Type 2 logic ONLY for DimProduct during initial load.**
     **DimAccount and DimSalesAgent are loaded as SCD Type 1.**
     Resets timestamp-based watermarks for the incremental load DAG at the end.
-    **Looks up ProductSK for FactSalesPerformance.ProductKey.**
+    **Looks up productsk for factsalesperformance.productkey.**
 
-    **WARNING:** Running this DAG will WIPE existing data in the target OLAP tables. Ensure OLTP has `updated_at` columns and OLAP schema is correct (SCD2 cols for DimProduct, ProductSK as PK; OpportunityID in FactSalesPerformance).
+    **WARNING:** Running this DAG will WIPE existing data in the target OLAP tables. Ensure OLTP has `updated_at` columns and OLAP schema is correct (SCD2 cols for dimproduct, productsk as PK; opportunityid in factsalesperformance).
     """
 )
 def b2b_initial_load_dag():
@@ -89,29 +89,28 @@ def b2b_initial_load_dag():
     # --- Task Group: Truncate Tables ---
     def _truncate_table(table_name: str, cascade: bool = False):
         """Helper Python function to truncate a table in the OLAP database."""
-        # Use double quotes around table name passed as argument
-        quoted_table_name = f'"{table_name}"'
+        # Use lowercase table name WITHOUT quotes
         hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID);
-        sql = f"TRUNCATE TABLE {quoted_table_name}{' CASCADE' if cascade else ''};"
+        sql = f"TRUNCATE TABLE {table_name}{' CASCADE' if cascade else ''};"
         logging.info(f"Running TRUNCATE command: {sql}")
         try: hook.run(sql); logging.info(f"Successfully truncated table {table_name}.")
         except Exception as e: logging.error(f"Failed to truncate table {table_name}: {e}"); raise
 
-    # Pass table names exactly as defined in schema (likely mixed case)
+    # Pass lowercase table names
     @task(task_id='truncate_fact_sales_performance')
-    def python_truncate_fact_sales_performance(): _truncate_table("FactSalesPerformance", cascade=True)
+    def python_truncate_fact_sales_performance(): _truncate_table("factsalesperformance", cascade=True)
     @task(task_id='truncate_fact_sales_monthly_aggregate')
-    def python_truncate_fact_monthly_aggregate(): _truncate_table("FactSalesMonthlyAggregate", cascade=True)
+    def python_truncate_fact_monthly_aggregate(): _truncate_table("factsalesmonthlyaggregate", cascade=True)
     @task(task_id='truncate_dim_account')
-    def python_truncate_dim_account(): _truncate_table("DimAccount", cascade=True)
+    def python_truncate_dim_account(): _truncate_table("dimaccount", cascade=True)
     @task(task_id='truncate_dim_product')
-    def python_truncate_dim_product(): _truncate_table("DimProduct", cascade=True)
+    def python_truncate_dim_product(): _truncate_table("dimproduct", cascade=True)
     @task(task_id='truncate_dim_sales_agent')
-    def python_truncate_dim_sales_agent(): _truncate_table("DimSalesAgent", cascade=True)
+    def python_truncate_dim_sales_agent(): _truncate_table("dimsalesagent", cascade=True)
     @task(task_id='truncate_dim_deal_stage')
-    def python_truncate_dim_deal_stage(): _truncate_table("DimDealStage", cascade=True)
+    def python_truncate_dim_deal_stage(): _truncate_table("dimdealstage", cascade=True)
     @task(task_id='truncate_dim_date')
-    def python_truncate_dim_date(): _truncate_table("DimDate", cascade=True)
+    def python_truncate_dim_date(): _truncate_table("dimdate", cascade=True)
 
     truncate_fact_sales_perf_task = python_truncate_fact_sales_performance()
     truncate_fact_monthly_agg_task = python_truncate_fact_monthly_aggregate()
@@ -124,7 +123,7 @@ def b2b_initial_load_dag():
     truncate_dims = [truncate_dim_account_task, truncate_dim_product_task, truncate_dim_sales_agent_task, truncate_dim_deal_stage_task, truncate_dim_date_task]
 
     # --- Dimension Load Tasks (Initial Load Logic) ---
-    # Use quoted table and column names for OLAP interactions
+    # Use lowercase table and column names for OLAP interactions
     @task
     def load_dim_date():
         hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID); hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
@@ -136,15 +135,15 @@ def b2b_initial_load_dag():
             else: logging.warning("Could not determine date range. Using defaults.")
         except Exception as e: logging.error(f"Error processing date range: {e}. Using defaults.")
         min_year_start = pendulum.parse(min_date_str).start_of('year').to_date_string(); max_year_end = pendulum.parse(max_date_str).end_of('year').to_date_string()
-        # Use quoted identifiers for OLAP table/columns
-        sql_insert_dates = f"""INSERT INTO "DimDate" ("DateKey", "Date", "Day", "Month", "Quarter", "Year") SELECT TO_CHAR(datum, 'YYYYMMDD')::INT, datum, EXTRACT(DAY FROM datum), EXTRACT(MONTH FROM datum), EXTRACT(QUARTER FROM datum), EXTRACT(YEAR FROM datum) FROM generate_series('{min_year_start}'::DATE, '{max_year_end}'::DATE, '1 day'::INTERVAL) datum;"""
-        logging.info("Populating DimDate..."); hook_olap.run(sql_insert_dates); logging.info("DimDate populated.")
+        # Use lowercase, unquoted identifiers for OLAP table/columns
+        sql_insert_dates = f"""INSERT INTO dimdate (datekey, date, day, month, quarter, year) SELECT TO_CHAR(datum, 'YYYYMMDD')::INT, datum, EXTRACT(DAY FROM datum), EXTRACT(MONTH FROM datum), EXTRACT(QUARTER FROM datum), EXTRACT(YEAR FROM datum) FROM generate_series('{min_year_start}'::DATE, '{max_year_end}'::DATE, '1 day'::INTERVAL) datum;"""
+        logging.info("Populating dimdate..."); hook_olap.run(sql_insert_dates); logging.info("dimdate populated.")
     @task
     def load_dim_deal_stage():
         hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID); hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
         stages = hook_oltp.get_records("SELECT DealStageID, StageName FROM DealStages")
-        # Use quoted identifiers
-        if stages: hook_olap.insert_rows(table='"DimDealStage"', rows=stages, target_fields=['"StageID"', '"StageName"'], commit_every=DEFAULT_BATCH_SIZE); logging.info(f"Loaded {len(stages)} rows into DimDealStage.")
+        # Use lowercase, unquoted identifiers
+        if stages: hook_olap.insert_rows(table="dimdealstage", rows=stages, target_fields=["stageid", "stagename"], commit_every=DEFAULT_BATCH_SIZE); logging.info(f"Loaded {len(stages)} rows into dimdealstage.")
     @task
     def load_dim_account(): # SCD1
         variable_name = "initial_load_dim_account_offset"; batch_size = DEFAULT_BATCH_SIZE; total_rows_processed = 0
@@ -153,27 +152,27 @@ def b2b_initial_load_dag():
             sql_extract = """SELECT a.AccountID, a.AccountName, s.SectorName, CASE WHEN a.Revenue < 1000000 THEN 'Under 1M' WHEN a.Revenue BETWEEN 1000000 AND 10000000 THEN '1M-10M' WHEN a.Revenue > 10000000 THEN 'Over 10M' ELSE 'Unknown' END, a.ParentAccountID FROM Accounts a LEFT JOIN Sectors s ON a.SectorID = s.SectorID ORDER BY a.AccountID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
-            olap_data = [(row[0], row[1], row[2], row[3], row[4]) for row in source_data]; target_fields = ['"AccountID"', '"AccountName"', '"Sector"', '"RevenueRange"', '"ParentAccountID"']
+            olap_data = [(row[0], row[1], row[2], row[3], row[4]) for row in source_data]; target_fields = ["accountid", "accountname", "sector", "revenuerange", "parentaccountid"]
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-            try: hook_olap.insert_rows(table='"DimAccount"', rows=olap_data, target_fields=target_fields, commit_every=batch_size); rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
+            try: hook_olap.insert_rows(table="dimaccount", rows=olap_data, target_fields=target_fields, commit_every=batch_size); rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
             except Exception as e: logging.error(f"Failed DimAccount batch {current_offset}: {e}"); raise AirflowSkipException() from e
             if len(source_data) < batch_size: break
-        logging.info(f"Finished loading DimAccount (SCD1). Total: {total_rows_processed}")
+        logging.info(f"Finished loading dimaccount (SCD1). Total: {total_rows_processed}")
     @task
     def load_dim_product(): # SCD2
         variable_name = "initial_load_dim_product_offset"; batch_size = DEFAULT_BATCH_SIZE; total_rows_processed = 0
-        initial_valid_from = DEFAULT_SCD2_VALID_FROM; logging.info(f"Initial load DimProduct (SCD2), ValidFrom={initial_valid_from}")
+        initial_valid_from = DEFAULT_SCD2_VALID_FROM; logging.info(f"Initial load dimproduct (SCD2), ValidFrom={initial_valid_from}")
         while True:
             current_offset = get_batch_state(variable_name, 0); hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
             sql_extract = """SELECT p.ProductID, p.ProductName, ps.SeriesName, p.SalesPrice, CASE WHEN p.SalesPrice < 100 THEN 'Low' WHEN p.SalesPrice BETWEEN 100 AND 1000 THEN 'Medium' WHEN p.SalesPrice > 1000 THEN 'High' ELSE 'Unknown' END FROM Products p LEFT JOIN ProductSeries ps ON p.SeriesID = ps.SeriesID ORDER BY p.ProductID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
-            olap_data = [(row[0], row[1], row[2], row[3], row[4], initial_valid_from, None, True) for row in source_data]; target_fields = ['"ProductID"', '"ProductName"', '"SeriesName"', '"Price"', '"PriceRange"', '"ValidFrom"', '"ValidTo"', '"IsCurrent"']
+            olap_data = [(row[0], row[1], row[2], row[3], row[4], initial_valid_from, None, True) for row in source_data]; target_fields = ["productid", "productname", "seriesname", "price", "pricerange", "validfrom", "validto", "iscurrent"]
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-            try: hook_olap.insert_rows(table='"DimProduct"', rows=olap_data, target_fields=target_fields, commit_every=batch_size); rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
-            except Exception as e: logging.error(f"Failed DimProduct batch {current_offset}: {e}"); raise AirflowSkipException() from e
+            try: hook_olap.insert_rows(table="dimproduct", rows=olap_data, target_fields=target_fields, commit_every=batch_size); rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
+            except Exception as e: logging.error(f"Failed dimproduct batch {current_offset}: {e}"); raise AirflowSkipException() from e
             if len(source_data) < batch_size: break
-        logging.info(f"Finished loading DimProduct (SCD2). Total: {total_rows_processed}")
+        logging.info(f"Finished loading dimproduct (SCD2). Total: {total_rows_processed}")
     @task
     def load_dim_sales_agent(): # SCD1
         variable_name = "initial_load_dim_sales_agent_offset"; batch_size = DEFAULT_BATCH_SIZE; total_rows_processed = 0
@@ -182,17 +181,17 @@ def b2b_initial_load_dag():
             sql_extract = """SELECT sa.SalesAgentID, sa.SalesAgentName, sm.ManagerName, l.LocationName AS Region FROM SalesAgents sa LEFT JOIN SalesManagers sm ON sa.ManagerID = sm.ManagerID LEFT JOIN Locations l ON sa.RegionalOfficeID = l.LocationID ORDER BY sa.SalesAgentID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
-            olap_data = [(row[0], row[1], row[2], row[3]) for row in source_data]; target_fields = ['"SalesAgentID"', '"SalesAgentName"', '"ManagerName"', '"Region"']
+            olap_data = [(row[0], row[1], row[2], row[3]) for row in source_data]; target_fields = ["salesagentid", "salesagentname", "managername", "region"]
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-            try: hook_olap.insert_rows(table='"DimSalesAgent"', rows=olap_data, target_fields=target_fields, commit_every=batch_size); rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
-            except Exception as e: logging.error(f"Failed DimSalesAgent batch {current_offset}: {e}"); raise AirflowSkipException() from e
+            try: hook_olap.insert_rows(table="dimsalesagent", rows=olap_data, target_fields=target_fields, commit_every=batch_size); rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
+            except Exception as e: logging.error(f"Failed dimsalesagent batch {current_offset}: {e}"); raise AirflowSkipException() from e
             if len(source_data) < batch_size: break
-        logging.info(f"Finished loading DimSalesAgent (SCD1). Total: {total_rows_processed}")
+        logging.info(f"Finished loading dimsalesagent (SCD1). Total: {total_rows_processed}")
 
     # --- Task: Fact Table - SalesPerformance (Initial Load) ---
     @task
     def load_fact_sales_performance():
-        """Loads FactSalesPerformance, looking up appropriate dimension keys (using ProductSK)."""
+        """Loads factsalesperformance, looking up appropriate dimension keys (using productsk)."""
         variable_name = "initial_load_fact_sales_perf_offset"; batch_size = DEFAULT_BATCH_SIZE; total_rows_processed = 0
         hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID); hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
         while True:
@@ -206,12 +205,12 @@ def b2b_initial_load_dag():
                 try:
                     opportunity_id, oltp_sales_agent_id, oltp_product_id, oltp_account_id, oltp_deal_stage_id, _, _, close_value, duration_days, expected_success_rate, event_date = row
                     event_date_str = pendulum.instance(event_date).to_date_string()
-                    # Lookups: Use quoted identifiers for OLAP tables/columns
-                    date_key_res = hook_olap.get_first('SELECT "DateKey" FROM "DimDate" WHERE "Date" = %s', parameters=(event_date_str,))
-                    account_key_res = hook_olap.get_first('SELECT "AccountID" FROM "DimAccount" WHERE "AccountID" = %s', parameters=(oltp_account_id,))
-                    product_sk_res = hook_olap.get_first('SELECT "ProductSK" FROM "DimProduct" WHERE "ProductID" = %s AND "IsCurrent" = TRUE', parameters=(oltp_product_id,)) # Lookup ProductSK
-                    agent_key_res = hook_olap.get_first('SELECT "SalesAgentID" FROM "DimSalesAgent" WHERE "SalesAgentID" = %s', parameters=(oltp_sales_agent_id,))
-                    stage_key_res = hook_olap.get_first('SELECT "StageID" FROM "DimDealStage" WHERE "StageID" = %s', parameters=(oltp_deal_stage_id,))
+                    # Lookups: Use lowercase, unquoted identifiers for OLAP tables/columns
+                    date_key_res = hook_olap.get_first('SELECT datekey FROM dimdate WHERE date = %s', parameters=(event_date_str,))
+                    account_key_res = hook_olap.get_first('SELECT accountid FROM dimaccount WHERE accountid = %s', parameters=(oltp_account_id,))
+                    product_sk_res = hook_olap.get_first('SELECT productsk FROM dimproduct WHERE productid = %s AND iscurrent = TRUE', parameters=(oltp_product_id,)) # Lookup ProductSK
+                    agent_key_res = hook_olap.get_first('SELECT salesagentid FROM dimsalesagent WHERE salesagentid = %s', parameters=(oltp_sales_agent_id,))
+                    stage_key_res = hook_olap.get_first('SELECT stageid FROM dimdealstage WHERE stageid = %s', parameters=(oltp_deal_stage_id,))
                     date_key = date_key_res[0] if date_key_res else None; account_key = account_key_res[0] if account_key_res else None
                     product_key = product_sk_res[0] if product_sk_res else None # This is ProductSK
                     agent_key = agent_key_res[0] if agent_key_res else None; stage_key = stage_key_res[0] if stage_key_res else None
@@ -222,15 +221,15 @@ def b2b_initial_load_dag():
                 except Exception as lookup_ex: missing_keys_count += 1; logging.error(f"Initial Load: Dim lookup error OppID {row[0]}: {lookup_ex}")
             if olap_data_to_insert:
                 try:
-                    # Use quoted identifiers for target table and fields
+                    # Use lowercase, unquoted identifiers
                     # ** Assuming OpportunityID column exists in factsalesperformance **
-                    target_fields = ['"OpportunityID"', '"DateKey"', '"AccountKey"', '"ProductKey"', '"SalesAgentKey"', '"DealStageKey"', '"CloseValue"', '"DurationDays"', '"ExpectedSuccessRate"']
-                    hook_olap.insert_rows(table='"FactSalesPerformance"', rows=olap_data_to_insert, target_fields=target_fields, commit_every=batch_size)
+                    target_fields = ["opportunityid", "datekey", "accountkey", "productkey", "salesagentkey", "dealstagekey", "closevalue", "durationdays", "expectedsuccessrate"]
+                    hook_olap.insert_rows(table="factsalesperformance", rows=olap_data_to_insert, target_fields=target_fields, commit_every=batch_size)
                     rows_loaded = len(olap_data_to_insert); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + len(source_data))
                 except Exception as e: logging.error(f"Failed fact insert batch {current_offset}: {e}"); raise AirflowSkipException() from e
             else: set_batch_state(variable_name, current_offset + len(source_data)); logging.warning(f"No valid fact data in batch {current_offset}")
             if len(source_data) < batch_size: break
-        logging.info(f"Finished loading FactSalesPerformance. Inserted: {total_rows_processed}. Skipped: {missing_keys_count}")
+        logging.info(f"Finished loading factsalesperformance. Inserted: {total_rows_processed}. Skipped: {missing_keys_count}")
 
     # --- Task: Reset Incremental Timestamp Watermarks ---
     @task
