@@ -83,19 +83,10 @@ def b2b_initial_load_dag():
 
     def _truncate_table(table_name: str, cascade: bool = False):
         """Helper Python function to truncate a table in the OLAP database."""
-        hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-        sql = f"TRUNCATE TABLE {table_name}{' CASCADE' if cascade else ''};"
+        hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID); sql = f"TRUNCATE TABLE {table_name}{' CASCADE' if cascade else ''};"
         logging.info(f"Running TRUNCATE command: {sql}")
-        try:
-            hook.run(sql)
-            logging.info(f"Successfully truncated table {table_name}.")
-        except Exception as e:
-            from psycopg2 import errors as pg_errors
-            if isinstance(e, pg_errors.UndefinedTable):
-                logging.warning(f"Table {table_name} does not exist, skipping truncate.")
-                return
-            logging.error(f"Failed to truncate table {table_name}: {e}")
-            raise
+        try: hook.run(sql); logging.info(f"Successfully truncated table {table_name}.")
+        except Exception as e: logging.error(f"Failed to truncate table {table_name}: {e}"); raise
 
     @task(task_id='truncate_fact_sales_performance')
     def python_truncate_fact_sales_performance(): _truncate_table("FactSalesPerformance", cascade=True)
@@ -112,34 +103,6 @@ def b2b_initial_load_dag():
     @task(task_id='truncate_dim_date')
     def python_truncate_dim_date(): _truncate_table("DimDate", cascade=True)
 
-    @task(task_id='create_dim_date_table')
-    def create_dim_date_table():
-        """Create DimDate table if it doesn't exist."""
-        hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-        ddl = '''
-        CREATE TABLE IF NOT EXISTS DimDate (
-            DateKey INT PRIMARY KEY,
-            Date DATE NOT NULL,
-            Day INT NOT NULL,
-            Month INT NOT NULL,
-            Quarter INT NOT NULL,
-            Year INT NOT NULL
-        );
-        '''
-        hook.run(ddl)
-
-    @task(task_id='create_dim_deal_stage_table')
-    def create_dim_deal_stage_table():
-        """Create DimDealStage table if it doesn't exist."""
-        hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-        ddl = '''
-        CREATE TABLE IF NOT EXISTS DimDealStage (
-            StageID INT PRIMARY KEY,
-            StageName VARCHAR(255) NOT NULL
-        );
-        '''
-        hook.run(ddl)
-
     truncate_fact_sales_perf_task = python_truncate_fact_sales_performance()
     truncate_fact_monthly_agg_task = python_truncate_fact_monthly_aggregate()
     truncate_dim_account_task = python_truncate_dim_account()
@@ -149,9 +112,6 @@ def b2b_initial_load_dag():
     truncate_dim_date_task = python_truncate_dim_date()
     truncate_facts = [truncate_fact_sales_perf_task, truncate_fact_monthly_agg_task]
     truncate_dims = [truncate_dim_account_task, truncate_dim_product_task, truncate_dim_sales_agent_task, truncate_dim_deal_stage_task, truncate_dim_date_task]
-
-    create_dim_date_table_task = create_dim_date_table()
-    create_dim_deal_stage_table_task = create_dim_deal_stage_table()
 
     @task
     def load_dim_date():
@@ -328,13 +288,7 @@ def b2b_initial_load_dag():
     task_reset_watermarks = reset_incremental_watermarks()
     load_dims_tasks = [task_load_date, task_load_stage, task_load_account, task_load_product, task_load_agent]
 
-    # Initial sequence: reset states, then create dimension tables
-    start >> task_reset_states
-    task_reset_states >> create_dim_date_table_task
-    task_reset_states >> create_dim_deal_stage_table_task
-
-    # Once dimension tables exist, truncate facts
-    cross_downstream([create_dim_date_table_task, create_dim_deal_stage_table_task], truncate_facts)
+    start >> task_reset_states >> truncate_facts
     cross_downstream(truncate_facts, truncate_dims)
     cross_downstream(truncate_dims, load_dims_tasks)
     load_dims_tasks >> task_load_facts >> task_reset_watermarks >> end
