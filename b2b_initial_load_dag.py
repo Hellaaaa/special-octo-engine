@@ -93,8 +93,16 @@ def b2b_initial_load_dag():
         hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID);
         sql = f"TRUNCATE TABLE {table_name}{' CASCADE' if cascade else ''};"
         logging.info(f"Running TRUNCATE command: {sql}")
-        try: hook.run(sql); logging.info(f"Successfully truncated table {table_name}.")
-        except Exception as e: logging.error(f"Failed to truncate table {table_name}: {e}"); raise
+        try:
+            hook.run(sql)
+            logging.info(f"Successfully truncated table {table_name}.")
+        except Exception as e:
+            from psycopg2 import errors as pg_errors
+            if isinstance(e, pg_errors.UndefinedTable):
+                logging.warning(f"Table {table_name} does not exist, skipping truncate.")
+                return
+            logging.error(f"Failed to truncate table {table_name}: {e}")
+            raise
 
     # Pass lowercase table names
     @task(task_id='truncate_fact_sales_performance')
