@@ -33,15 +33,18 @@ DEFAULT_START_TIME = '1970-01-01T00:00:00+00:00'
 # --- Helper Functions ---
 # (get/set/reset_batch_state remain the same)
 def get_batch_state(variable_name, default_value=0):
+    """Gets the starting offset for the next batch for this specific DAG run."""
     try:
         if Variable.get(variable_name, default_var=None) is None: return default_value
         return int(Variable.get(variable_name))
     except ValueError: logging.warning(f"Batch state variable {variable_name} has non-integer value, using default {default_value}"); return default_value
     except Exception as e: logging.error(f"Could not retrieve batch state variable {variable_name}: {e}"); logging.warning(f"Using default {default_value} due to error retrieving variable."); return default_value
 def set_batch_state(variable_name, value):
+    """Sets the starting offset for the next batch for this specific DAG run."""
     try: Variable.set(variable_name, str(value))
     except Exception as e: logging.error(f"Could not set batch state variable {variable_name}: {e}")
 def reset_batch_state(variable_name):
+     """Deletes the batch state variable at the start of a full load."""
      try: Variable.delete(variable_name); logging.info(f"Reset batch state variable {variable_name}.")
      except AirflowNotFoundException: logging.info(f"Batch state variable {variable_name} not found, no need to delete.")
      except Exception as e: logging.warning(f"Could not delete batch state variable {variable_name}: {e}")
@@ -56,12 +59,12 @@ def reset_batch_state(variable_name):
     default_args={'retry_delay': timedelta(minutes=2)}, # Keep retry delay
     tags=['b2b_sales', 'initial_load', 'repopulatable', 'refined', 'scd2_product_only'],
     doc_md="""
-    ### B2B Sales Initial Load DAG (Fixed DimProduct Insert)
+    ### B2B Sales Initial Load DAG (Upsert for SCD1 Dims)
 
     Performs the initial population of the OLAP database from the OLTP source.
     **TRUNCATES target tables (with CASCADE). Uses lowercase unquoted identifiers qualified with the schema.**
     **Implements SCD Type 2 logic ONLY for dimproduct during initial load.**
-    **dimaccount and dimsalesagent are loaded as SCD Type 1.**
+    **DimAccount and DimSalesAgent are loaded using explicit UPSERT (SCD Type 1).**
     Resets timestamp-based watermarks for the incremental load DAG at the end.
     **Looks up productsk for factsalesperformance.productkey.**
 
@@ -93,10 +96,7 @@ def b2b_initial_load_dag():
         logging.info(f"Running TRUNCATE command: {sql}")
         try: hook.run(sql); logging.info(f"Successfully truncated table {qualified_table_name}.")
         except Exception as e:
-            # Check specifically for UndefinedTable error
-            if psycopg2 and isinstance(e, psycopg2.errors.UndefinedTable):
-                logging.warning(f"Table {qualified_table_name} does not exist, skipping truncate.")
-                return # Don't fail the task if table doesn't exist
+            if psycopg2 and isinstance(e, psycopg2.errors.UndefinedTable): logging.warning(f"Table {qualified_table_name} does not exist, skipping truncate."); return
             logging.error(f"Failed to truncate table {qualified_table_name}: {e}"); raise
 
     @task(task_id='truncate_fact_sales_performance')
@@ -143,31 +143,46 @@ def b2b_initial_load_dag():
         hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID); hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
         stages = hook_oltp.get_records("SELECT DealStageID, StageName FROM DealStages")
         if stages:
-            unique_stages = {sid: name for sid, name in stages} # Handle potential duplicates from source
-            stages_to_load = list(unique_stages.items())
+            unique_stages = {sid: name for sid, name in stages}; stages_to_load = list(unique_stages.items())
             try:
-                # Use simple insert_rows as table is truncated
-                hook_olap.insert_rows(table=f"{OLAP_SCHEMA}.dimdealstage", rows=stages_to_load, target_fields=["stageid", "stagename"], commit_every=DEFAULT_BATCH_SIZE)
-                logging.info(f"Loaded {len(stages_to_load)} rows into dimdealstage.")
+                # Use UPSERT logic row-by-row for robustness
+                with hook_olap.get_conn() as conn:
+                    with conn.cursor() as cur:
+                        for sid, name in stages_to_load:
+                            cur.execute(f"""INSERT INTO {OLAP_SCHEMA}.dimdealstage (stageid, stagename) VALUES (%s, %s) ON CONFLICT (stageid) DO UPDATE SET stagename = EXCLUDED.stagename;""", (sid, name))
+                    conn.commit()
+                logging.info(f"Upserted {len(stages_to_load)} rows into dimdealstage.")
             except Exception as e: logging.error(f"Failed to load dimdealstage: {e}"); raise
         else: logging.info("No stages found in OLTP.")
     @task
-    def load_dim_account(): # SCD1
+    def load_dim_account(): # SCD1 - Using UPSERT
         variable_name = "initial_load_dim_account_offset"; batch_size = DEFAULT_BATCH_SIZE; total_rows_processed = 0
         while True:
             current_offset = get_batch_state(variable_name, 0); hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
             sql_extract = """SELECT a.AccountID, a.AccountName, s.SectorName, CASE WHEN a.Revenue < 1000000 THEN 'Under 1M' WHEN a.Revenue BETWEEN 1000000 AND 10000000 THEN '1M-10M' WHEN a.Revenue > 10000000 THEN 'Over 10M' ELSE 'Unknown' END, a.ParentAccountID FROM Accounts a LEFT JOIN Sectors s ON a.SectorID = s.SectorID ORDER BY a.AccountID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
-            olap_data = [(row[0], row[1], row[2], row[3], row[4]) for row in source_data]; target_fields = ["accountid", "accountname", "sector", "revenuerange", "parentaccountid"]
+            olap_data = [(row[0], row[1], row[2], row[3], row[4]) for row in source_data]
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
             try:
-                # Use simple insert_rows as table is truncated
-                hook_olap.insert_rows(table=f"{OLAP_SCHEMA}.dimaccount", rows=olap_data, target_fields=target_fields, commit_every=batch_size)
+                # Execute UPSERT row by row within a transaction for the batch
+                with hook_olap.get_conn() as conn:
+                    with conn.cursor() as cur:
+                        for record in olap_data:
+                            cur.execute(f"""
+                                INSERT INTO {OLAP_SCHEMA}.dimaccount (accountid, accountname, sector, revenuerange, parentaccountid)
+                                VALUES (%s, %s, %s, %s, %s)
+                                ON CONFLICT (accountid) DO UPDATE SET
+                                    accountname = EXCLUDED.accountname,
+                                    sector = EXCLUDED.sector,
+                                    revenuerange = EXCLUDED.revenuerange,
+                                    parentaccountid = EXCLUDED.parentaccountid;
+                                """, record)
+                    conn.commit() # Commit after processing the batch
                 rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
             except Exception as e: logging.error(f"Failed DimAccount batch {current_offset}: {e}"); raise AirflowSkipException() from e
             if len(source_data) < batch_size: break
-        logging.info(f"Finished loading dimaccount (SCD1). Total: {total_rows_processed}")
+        logging.info(f"Finished loading dimaccount (SCD1 - Upsert). Total: {total_rows_processed}")
     @task
     def load_dim_product(): # SCD2
         variable_name = "initial_load_dim_product_offset"; batch_size = DEFAULT_BATCH_SIZE; total_rows_processed = 0
@@ -177,29 +192,41 @@ def b2b_initial_load_dag():
             sql_extract = """SELECT p.ProductID, p.ProductName, ps.SeriesName, p.SalesPrice, CASE WHEN p.SalesPrice < 100 THEN 'Low' WHEN p.SalesPrice BETWEEN 100 AND 1000 THEN 'Medium' WHEN p.SalesPrice > 1000 THEN 'High' ELSE 'Unknown' END FROM Products p LEFT JOIN ProductSeries ps ON p.SeriesID = ps.SeriesID ORDER BY p.ProductID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
+            # Still use insert_rows here as it's a simple insert after truncate, no conflict expected
             olap_data = [(row[0], row[1], row[2], row[3], row[4], initial_valid_from, None, True) for row in source_data]; target_fields = ["productid", "productname", "seriesname", "price", "pricerange", "validfrom", "validto", "iscurrent"]
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-            try:
-                 # Use simple insert_rows as table is truncated
-                 hook_olap.insert_rows(table=f"{OLAP_SCHEMA}.dimproduct", rows=olap_data, target_fields=target_fields, commit_every=batch_size)
-                 rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
+            try: hook_olap.insert_rows(table=f"{OLAP_SCHEMA}.dimproduct", rows=olap_data, target_fields=target_fields, commit_every=batch_size); rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
             except Exception as e: logging.error(f"Failed dimproduct batch {current_offset}: {e}"); raise AirflowSkipException() from e
             if len(source_data) < batch_size: break
         logging.info(f"Finished loading dimproduct (SCD2). Total: {total_rows_processed}")
     @task
-    def load_dim_sales_agent(): # SCD1
+    def load_dim_sales_agent(): # SCD1 - Using UPSERT
         variable_name = "initial_load_dim_sales_agent_offset"; batch_size = DEFAULT_BATCH_SIZE; total_rows_processed = 0
         while True:
             current_offset = get_batch_state(variable_name, 0); hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
             sql_extract = """SELECT sa.SalesAgentID, sa.SalesAgentName, sm.ManagerName, l.LocationName AS Region FROM SalesAgents sa LEFT JOIN SalesManagers sm ON sa.ManagerID = sm.ManagerID LEFT JOIN Locations l ON sa.RegionalOfficeID = l.LocationID ORDER BY sa.SalesAgentID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
-            olap_data = [(row[0], row[1], row[2], row[3]) for row in source_data]; target_fields = ["salesagentid", "salesagentname", "managername", "region"]
+            olap_data = [(row[0], row[1], row[2], row[3]) for row in source_data]
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-            try: hook_olap.insert_rows(table=f"{OLAP_SCHEMA}.dimsalesagent", rows=olap_data, target_fields=target_fields, commit_every=batch_size); rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
+            try:
+                # Execute UPSERT row by row within a transaction for the batch
+                with hook_olap.get_conn() as conn:
+                    with conn.cursor() as cur:
+                        for record in olap_data:
+                            cur.execute(f"""
+                                INSERT INTO {OLAP_SCHEMA}.dimsalesagent (salesagentid, salesagentname, managername, region)
+                                VALUES (%s, %s, %s, %s)
+                                ON CONFLICT (salesagentid) DO UPDATE SET
+                                    salesagentname = EXCLUDED.salesagentname,
+                                    managername = EXCLUDED.managername,
+                                    region = EXCLUDED.region;
+                                """, record)
+                    conn.commit() # Commit after processing the batch
+                rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
             except Exception as e: logging.error(f"Failed dimsalesagent batch {current_offset}: {e}"); raise AirflowSkipException() from e
             if len(source_data) < batch_size: break
-        logging.info(f"Finished loading dimsalesagent (SCD1). Total: {total_rows_processed}")
+        logging.info(f"Finished loading dimsalesagent (SCD1 - Upsert). Total: {total_rows_processed}")
 
     # --- Task: Fact Table - SalesPerformance (Initial Load) ---
     @task
