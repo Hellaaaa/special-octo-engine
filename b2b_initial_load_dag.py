@@ -282,7 +282,19 @@ def b2b_initial_load_dag():
         hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID); hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
         while True:
             current_offset = get_batch_state(variable_name, 0)
-            sql_extract = """SELECT sp.OpportunityID, sp.SalesAgentID, sp.ProductID, sp.AccountID, sp.DealStageID, sp.EngageDate, sp.CloseDate, sp.CloseValue, CASE WHEN sp.CloseDate IS NOT NULL AND sp.EngageDate IS NOT NULL THEN sp.CloseDate - sp.EngageDate ELSE NULL END, CASE ds.StageName WHEN 'Won' THEN 100.0 WHEN 'Lost' THEN 0.0 WHEN 'Engaging' THEN 75.0 WHEN 'Prospecting' THEN 25.0 ELSE 10.0 END, COALESCE(sp.CloseDate, sp.EngageDate) as EventDate FROM SalesPipeline sp LEFT JOIN DealStages ds ON sp.DealStageID = ds.DealStageID WHERE sp.AccountID IS NOT NULL AND sp.ProductID IS NOT NULL AND sp.SalesAgentID IS NOT NULL AND sp.DealStageID IS NOT NULL AND COALESCE(sp.CloseDate, sp.EngageDate) IS NOT NULL ORDER BY sp.OpportunityID LIMIT %s OFFSET %s;"""
+            sql_extract = """SELECT sp.OpportunityID, sp.SalesAgentID, sp.ProductID, sp.AccountID, sp.DealStageID, sp.EngageDate, sp.CloseDate, sp.CloseValue,
+            CASE WHEN sp.CloseDate IS NOT NULL AND sp.EngageDate IS NOT NULL THEN CAST(sp.CloseDate AS DATE) - CAST(sp.EngageDate AS DATE) ELSE NULL END,
+            CASE ds.StageName WHEN 'Won' THEN 100.0 WHEN 'Lost' THEN 0.0 WHEN 'Engaging' THEN 75.0 WHEN 'Prospecting' THEN 25.0 ELSE 10.0 END,
+            COALESCE(sp.CloseDate, sp.EngageDate) as EventDate
+            FROM SalesPipeline sp
+            LEFT JOIN DealStages ds ON sp.DealStageID = ds.DealStageID
+            WHERE sp.AccountID IS NOT NULL
+              AND sp.ProductID IS NOT NULL
+              AND sp.SalesAgentID IS NOT NULL
+              AND sp.DealStageID IS NOT NULL
+              AND COALESCE(sp.CloseDate, sp.EngageDate) IS NOT NULL
+            ORDER BY sp.OpportunityID
+            LIMIT %s OFFSET %s;"""
             try: source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             except Exception as e: logging.error(f"Failed fetch SalesPipeline offset {current_offset}: {e}"); raise AirflowSkipException() from e
             if not source_data: break
