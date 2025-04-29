@@ -328,7 +328,13 @@ def b2b_initial_load_dag():
     task_reset_watermarks = reset_incremental_watermarks()
     load_dims_tasks = [task_load_date, task_load_stage, task_load_account, task_load_product, task_load_agent]
 
-    start >> task_reset_states >> [create_dim_date_table_task, create_dim_deal_stage_table_task] >> truncate_facts
+    # Initial sequence: reset states, then create dimension tables
+    start >> task_reset_states
+    task_reset_states >> create_dim_date_table_task
+    task_reset_states >> create_dim_deal_stage_table_task
+
+    # Once dimension tables exist, truncate facts
+    cross_downstream([create_dim_date_table_task, create_dim_deal_stage_table_task], truncate_facts)
     cross_downstream(truncate_facts, truncate_dims)
     cross_downstream(truncate_dims, load_dims_tasks)
     load_dims_tasks >> task_load_facts >> task_reset_watermarks >> end
