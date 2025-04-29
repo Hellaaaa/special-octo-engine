@@ -130,6 +130,54 @@ def b2b_initial_load_dag():
     truncate_facts = [truncate_fact_sales_perf_task, truncate_fact_monthly_agg_task]
     truncate_dims = [truncate_dim_account_task, truncate_dim_product_task, truncate_dim_sales_agent_task, truncate_dim_deal_stage_task, truncate_dim_date_task]
 
+    # --- Create Table Tasks ---
+    @task(task_id='create_dim_account_table')
+    def create_dim_account_table():
+        """Create dimaccount table if it doesn't exist."""
+        hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
+        ddl = '''
+        CREATE TABLE IF NOT EXISTS dimaccount (
+            accountid INT PRIMARY KEY,
+            accountname VARCHAR(255) NOT NULL,
+            sector VARCHAR(100),
+            revenuerange VARCHAR(50),
+            parentaccountid INT
+        );
+        '''
+        hook.run(ddl)
+
+    @task(task_id='create_dim_product_table')
+    def create_dim_product_table():
+        """Create dimproduct table if it doesn't exist."""
+        hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
+        ddl = '''
+        CREATE TABLE IF NOT EXISTS dimproduct (
+            productid INT PRIMARY KEY,
+            productname VARCHAR(255) NOT NULL,
+            seriesname VARCHAR(255),
+            price NUMERIC,
+            pricerange VARCHAR(50),
+            validfrom DATE NOT NULL,
+            validto DATE,
+            iscurrent BOOLEAN NOT NULL
+        );
+        '''
+        hook.run(ddl)
+
+    @task(task_id='create_dim_sales_agent_table')
+    def create_dim_sales_agent_table():
+        """Create dimsalesagent table if it doesn't exist."""
+        hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
+        ddl = '''
+        CREATE TABLE IF NOT EXISTS dimsalesagent (
+            salesagentid INT PRIMARY KEY,
+            salesagentname VARCHAR(255) NOT NULL,
+            managername VARCHAR(255),
+            region VARCHAR(255)
+        );
+        '''
+        hook.run(ddl)
+
     # --- Dimension Load Tasks (Initial Load Logic) ---
     # Use lowercase table and column names for OLAP interactions
     @task
@@ -269,8 +317,70 @@ def b2b_initial_load_dag():
         logging.info("Resetting timestamp watermarks..."); [Variable.set(f"{WATERMARK_VAR_PREFIX}{t}", DEFAULT_START_TIME) for t in incremental_tables]; logging.info("Watermarks reset.")
 
     # --- Instantiate Tasks & Define Flow ---
-    task_load_date=load_dim_date(); task_load_stage=load_dim_deal_stage(); task_load_account=load_dim_account(); task_load_product=load_dim_product(); task_load_agent=load_dim_sales_agent(); task_load_facts=load_fact_sales_performance(); task_reset_watermarks=reset_incremental_watermarks()
+    # Ensure create_dim_date_table_task and create_dim_deal_stage_table_task are defined.
+    @task(task_id='create_dim_date_table')
+    def create_dim_date_table():
+        """Create dimdate table if it doesn't exist."""
+        hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
+        ddl = '''
+        CREATE TABLE IF NOT EXISTS dimdate (
+            datekey INT PRIMARY KEY,
+            date DATE NOT NULL,
+            day INT,
+            month INT,
+            quarter INT,
+            year INT
+        );
+        '''
+        hook.run(ddl)
+
+    @task(task_id='create_dim_deal_stage_table')
+    def create_dim_deal_stage_table():
+        """Create dimdealstage table if it doesn't exist."""
+        hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
+        ddl = '''
+        CREATE TABLE IF NOT EXISTS dimdealstage (
+            stageid INT PRIMARY KEY,
+            stagename VARCHAR(255) NOT NULL
+        );
+        '''
+        hook.run(ddl)
+
+    # Instantiate create table tasks
+    create_dim_date_table_task = create_dim_date_table()
+    create_dim_deal_stage_table_task = create_dim_deal_stage_table()
+    create_dim_account_table_task = create_dim_account_table()
+    create_dim_product_table_task = create_dim_product_table()
+    create_dim_sales_agent_table_task = create_dim_sales_agent_table()
+
+    task_load_date=load_dim_date()
+    task_load_stage=load_dim_deal_stage()
+    task_load_account=load_dim_account()
+    task_load_product=load_dim_product()
+    task_load_agent=load_dim_sales_agent()
+    task_load_facts=load_fact_sales_performance()
+    task_reset_watermarks=reset_incremental_watermarks()
     load_dims_tasks = [task_load_date, task_load_stage, task_load_account, task_load_product, task_load_agent]
-    start >> task_reset_states >> truncate_facts; cross_downstream(truncate_facts, truncate_dims); cross_downstream(truncate_dims, load_dims_tasks); load_dims_tasks >> task_load_facts >> task_reset_watermarks >> end
+
+    # --- DAG wiring with create tasks ---
+    start >> task_reset_states
+
+    # Create dimension tables
+    task_reset_states >> create_dim_date_table_task
+    task_reset_states >> create_dim_deal_stage_table_task
+    task_reset_states >> create_dim_account_table_task
+    task_reset_states >> create_dim_product_table_task
+    task_reset_states >> create_dim_sales_agent_table_task
+
+    # Truncate facts after all tables exist
+    cross_downstream(
+        [create_dim_date_table_task, create_dim_deal_stage_table_task, create_dim_account_table_task, create_dim_product_table_task, create_dim_sales_agent_table_task],
+        truncate_facts
+    )
+    cross_downstream(truncate_facts, truncate_dims)
+    cross_downstream(truncate_dims, load_dims_tasks)
+
+    # Final load and end
+    load_dims_tasks >> task_load_facts >> task_reset_watermarks >> end
 
 b2b_initial_load_dag()
