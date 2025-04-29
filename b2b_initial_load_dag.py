@@ -59,12 +59,12 @@ def reset_batch_state(variable_name):
     default_args={'retry_delay': timedelta(minutes=2)}, # Keep retry delay
     tags=['b2b_sales', 'initial_load', 'repopulatable', 'refined', 'scd2_product_only'],
     doc_md="""
-    ### B2B Sales Initial Load DAG (Upsert for SCD1 Dims)
+    ### B2B Sales Initial Load DAG (Fixed Date Handling)
 
     Performs the initial population of the OLAP database from the OLTP source.
     **TRUNCATES target tables (with CASCADE). Uses lowercase unquoted identifiers qualified with the schema.**
     **Implements SCD Type 2 logic ONLY for dimproduct during initial load.**
-    **DimAccount and DimSalesAgent are loaded using explicit UPSERT (SCD Type 1).**
+    **dimaccount and dimsalesagent are loaded using explicit UPSERT (SCD Type 1).**
     Resets timestamp-based watermarks for the incremental load DAG at the end.
     **Looks up productsk for factsalesperformance.productkey.**
 
@@ -145,11 +145,9 @@ def b2b_initial_load_dag():
         if stages:
             unique_stages = {sid: name for sid, name in stages}; stages_to_load = list(unique_stages.items())
             try:
-                # Use UPSERT logic row-by-row for robustness
                 with hook_olap.get_conn() as conn:
                     with conn.cursor() as cur:
-                        for sid, name in stages_to_load:
-                            cur.execute(f"""INSERT INTO {OLAP_SCHEMA}.dimdealstage (stageid, stagename) VALUES (%s, %s) ON CONFLICT (stageid) DO UPDATE SET stagename = EXCLUDED.stagename;""", (sid, name))
+                        for sid, name in stages_to_load: cur.execute(f"""INSERT INTO {OLAP_SCHEMA}.dimdealstage (stageid, stagename) VALUES (%s, %s) ON CONFLICT (stageid) DO UPDATE SET stagename = EXCLUDED.stagename;""", (sid, name))
                     conn.commit()
                 logging.info(f"Upserted {len(stages_to_load)} rows into dimdealstage.")
             except Exception as e: logging.error(f"Failed to load dimdealstage: {e}"); raise
@@ -165,20 +163,10 @@ def b2b_initial_load_dag():
             olap_data = [(row[0], row[1], row[2], row[3], row[4]) for row in source_data]
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
             try:
-                # Execute UPSERT row by row within a transaction for the batch
                 with hook_olap.get_conn() as conn:
                     with conn.cursor() as cur:
-                        for record in olap_data:
-                            cur.execute(f"""
-                                INSERT INTO {OLAP_SCHEMA}.dimaccount (accountid, accountname, sector, revenuerange, parentaccountid)
-                                VALUES (%s, %s, %s, %s, %s)
-                                ON CONFLICT (accountid) DO UPDATE SET
-                                    accountname = EXCLUDED.accountname,
-                                    sector = EXCLUDED.sector,
-                                    revenuerange = EXCLUDED.revenuerange,
-                                    parentaccountid = EXCLUDED.parentaccountid;
-                                """, record)
-                    conn.commit() # Commit after processing the batch
+                        for record in olap_data: cur.execute(f"""INSERT INTO {OLAP_SCHEMA}.dimaccount (accountid, accountname, sector, revenuerange, parentaccountid) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (accountid) DO UPDATE SET accountname = EXCLUDED.accountname, sector = EXCLUDED.sector, revenuerange = EXCLUDED.revenuerange, parentaccountid = EXCLUDED.parentaccountid;""", record)
+                    conn.commit()
                 rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
             except Exception as e: logging.error(f"Failed DimAccount batch {current_offset}: {e}"); raise AirflowSkipException() from e
             if len(source_data) < batch_size: break
@@ -192,7 +180,6 @@ def b2b_initial_load_dag():
             sql_extract = """SELECT p.ProductID, p.ProductName, ps.SeriesName, p.SalesPrice, CASE WHEN p.SalesPrice < 100 THEN 'Low' WHEN p.SalesPrice BETWEEN 100 AND 1000 THEN 'Medium' WHEN p.SalesPrice > 1000 THEN 'High' ELSE 'Unknown' END FROM Products p LEFT JOIN ProductSeries ps ON p.SeriesID = ps.SeriesID ORDER BY p.ProductID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
-            # Still use insert_rows here as it's a simple insert after truncate, no conflict expected
             olap_data = [(row[0], row[1], row[2], row[3], row[4], initial_valid_from, None, True) for row in source_data]; target_fields = ["productid", "productname", "seriesname", "price", "pricerange", "validfrom", "validto", "iscurrent"]
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
             try: hook_olap.insert_rows(table=f"{OLAP_SCHEMA}.dimproduct", rows=olap_data, target_fields=target_fields, commit_every=batch_size); rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
@@ -210,19 +197,10 @@ def b2b_initial_load_dag():
             olap_data = [(row[0], row[1], row[2], row[3]) for row in source_data]
             hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
             try:
-                # Execute UPSERT row by row within a transaction for the batch
                 with hook_olap.get_conn() as conn:
                     with conn.cursor() as cur:
-                        for record in olap_data:
-                            cur.execute(f"""
-                                INSERT INTO {OLAP_SCHEMA}.dimsalesagent (salesagentid, salesagentname, managername, region)
-                                VALUES (%s, %s, %s, %s)
-                                ON CONFLICT (salesagentid) DO UPDATE SET
-                                    salesagentname = EXCLUDED.salesagentname,
-                                    managername = EXCLUDED.managername,
-                                    region = EXCLUDED.region;
-                                """, record)
-                    conn.commit() # Commit after processing the batch
+                        for record in olap_data: cur.execute(f"""INSERT INTO {OLAP_SCHEMA}.dimsalesagent (salesagentid, salesagentname, managername, region) VALUES (%s, %s, %s, %s) ON CONFLICT (salesagentid) DO UPDATE SET salesagentname = EXCLUDED.salesagentname, managername = EXCLUDED.managername, region = EXCLUDED.region;""", record)
+                    conn.commit()
                 rows_loaded = len(olap_data); total_rows_processed += rows_loaded; set_batch_state(variable_name, current_offset + rows_loaded);
             except Exception as e: logging.error(f"Failed dimsalesagent batch {current_offset}: {e}"); raise AirflowSkipException() from e
             if len(source_data) < batch_size: break
@@ -244,7 +222,15 @@ def b2b_initial_load_dag():
             for row in source_data:
                 try:
                     opportunity_id, oltp_sales_agent_id, oltp_product_id, oltp_account_id, oltp_deal_stage_id, _, _, close_value, duration_days, expected_success_rate, event_date = row
-                    event_date_dt = pendulum.instance(event_date); event_date_str = event_date_dt.to_date_string()
+                    # ** CORRECTED DATE HANDLING **
+                    # Directly format if it's a date/datetime object, otherwise parse first
+                    if isinstance(event_date, (datetime, date)):
+                        event_date_str = event_date.strftime('%Y-%m-%d')
+                    else:
+                        # Attempt to parse if it's a string or other type
+                        event_date_str = pendulum.parse(str(event_date)).to_date_string()
+
+                    # Lookups: Use schema-qualified, lowercase, unquoted identifiers
                     date_key_res = hook_olap.get_first(f'SELECT datekey FROM {OLAP_SCHEMA}.dimdate WHERE date = %s', parameters=(event_date_str,))
                     account_key_res = hook_olap.get_first(f'SELECT accountid FROM {OLAP_SCHEMA}.dimaccount WHERE accountid = %s', parameters=(oltp_account_id,))
                     product_sk_res = hook_olap.get_first(f'SELECT productsk FROM {OLAP_SCHEMA}.dimproduct WHERE productid = %s AND iscurrent = TRUE', parameters=(oltp_product_id,))
