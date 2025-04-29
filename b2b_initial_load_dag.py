@@ -1,7 +1,7 @@
 # /path/to/your/airflow/dags/b2b_initial_load_dag.py
 import pendulum
 import logging
-from datetime import timedelta, date
+from datetime import timedelta, date, datetime # <-- Import datetime class
 # Ensure psycopg2 errors can be caught if needed, requires postgres provider installed
 try:
     import psycopg2
@@ -59,7 +59,7 @@ def reset_batch_state(variable_name):
     default_args={'retry_delay': timedelta(minutes=2)}, # Keep retry delay
     tags=['b2b_sales', 'initial_load', 'repopulatable', 'refined', 'scd2_product_only'],
     doc_md="""
-    ### B2B Sales Initial Load DAG (Fixed Date Handling)
+    ### B2B Sales Initial Load DAG (Fixed datetime Import)
 
     Performs the initial population of the OLAP database from the OLTP source.
     **TRUNCATES target tables (with CASCADE). Uses lowercase unquoted identifiers qualified with the schema.**
@@ -223,11 +223,9 @@ def b2b_initial_load_dag():
                 try:
                     opportunity_id, oltp_sales_agent_id, oltp_product_id, oltp_account_id, oltp_deal_stage_id, _, _, close_value, duration_days, expected_success_rate, event_date = row
                     # ** CORRECTED DATE HANDLING **
-                    # Directly format if it's a date/datetime object, otherwise parse first
                     if isinstance(event_date, (datetime, date)):
                         event_date_str = event_date.strftime('%Y-%m-%d')
                     else:
-                        # Attempt to parse if it's a string or other type
                         event_date_str = pendulum.parse(str(event_date)).to_date_string()
 
                     # Lookups: Use schema-qualified, lowercase, unquoted identifiers
@@ -242,7 +240,7 @@ def b2b_initial_load_dag():
                     if all([date_key, account_key, product_key, agent_key, stage_key]):
                          olap_data_to_insert.append((opportunity_id, date_key, account_key, product_key, agent_key, stage_key, close_value, duration_days, expected_success_rate))
                     else: missing_keys_count += 1; logging.warning(f"Initial Load: Skip OppID {opportunity_id} missing key for Event {event_date_str}. Found:[D:{date_key is not None},A:{account_key is not None},P:{product_key is not None},Ag:{agent_key is not None},S:{stage_key is not None}]")
-                except Exception as lookup_ex: missing_keys_count += 1; logging.error(f"Initial Load: Dim lookup error OppID {row[0]}: {lookup_ex}")
+                except Exception as lookup_ex: missing_keys_count += 1; logging.error(f"Initial Load: Dim lookup error OppID {row[0]}: {lookup_ex}") # Log the actual exception
             if olap_data_to_insert:
                 try:
                     target_fields = ["opportunityid", "datekey", "accountkey", "productkey", "salesagentkey", "dealstagekey", "closevalue", "durationdays", "expectedsuccessrate"]
