@@ -83,7 +83,7 @@ def b2b_initial_load_dag():
 
     def _truncate_table(table_name: str, cascade: bool = False):
         """Helper Python function to truncate a table in the OLAP database."""
-        hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID); sql = f"TRUNCATE TABLE {table_name}{' CASCADE' if cascade else ''};"
+        hook = PostgresHook(postgres_conn_id=OLAP_CONN_ID); sql = f"TRUNCATE TABLE IF EXISTS {table_name}{' CASCADE' if cascade else ''};"
         logging.info(f"Running TRUNCATE command: {sql}")
         try: hook.run(sql); logging.info(f"Successfully truncated table {table_name}.")
         except Exception as e: logging.error(f"Failed to truncate table {table_name}: {e}"); raise
