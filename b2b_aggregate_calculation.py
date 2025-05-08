@@ -8,7 +8,7 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.operators.empty import EmptyOperator
 
 # --- Configuration ---
-OLAP_CONN_ID = "crm_system_olap"
+OLAP_CONN_ID = "b2b_sales_olap"
 
 # --- DAG Definition ---
 @dag(
@@ -46,31 +46,31 @@ def b2b_aggregate_calculation_dag():
         Runs based on schedule, does not wait for upstream DAGs. No automatic retries on failure.
         """
         hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-        sql_truncate = "TRUNCATE TABLE factsalesmonthlyaggregate;"
+        sql_truncate = "TRUNCATE TABLE FactSalesMonthlyAggregate;"
         logging.info(f"Truncating {sql_truncate}...")
         try:
             hook_olap.run(sql_truncate)
-            logging.info("Table factsalesmonthlyaggregate truncated successfully.")
+            logging.info("Table FactSalesMonthlyAggregate truncated successfully.")
         except Exception as e:
-            logging.error(f"Error truncating factsalesmonthlyaggregate: {e}")
+            logging.error(f"Error truncating FactSalesMonthlyAggregate: {e}")
             raise
 
-        logging.info("Calculating and inserting aggregates into factsalesmonthlyaggregate...")
+        logging.info("Calculating and inserting aggregates into FactSalesMonthlyAggregate...")
         sql_aggregate = """
-        INSERT INTO factsalesmonthlyaggregate (
-            year, month, region, dealstagekey,
-            totaldealcount, totalclosevalue, avgdealvalue,
-            avgdurationdays, expectedsuccessrate
+        INSERT INTO FactSalesMonthlyAggregate (
+            Year, Month, Region, DealStageKey,
+            TotalDealCount, TotalCloseValue, AvgDealValue,
+            AvgDurationDays, ExpectedSuccessRate
         )
         SELECT
-            d.year, d.month, COALESCE(sa.region, 'Unknown') AS region, f.dealstagekey,
-            COUNT(*) AS totaldealcount, SUM(f.closevalue) AS totalclosevalue,
-            AVG(f.closevalue) AS avgdealvalue, AVG(f.durationdays) AS avgdurationdays,
-            AVG(f.expectedsuccessrate) AS expectedsuccessrate
-        FROM factsalesperformance f
-        JOIN dimdate d ON f.datekey = d.datekey
-        JOIN dimsalesagent sa ON f.salesagentkey = sa.salesagentid
-        GROUP BY d.year, d.month, COALESCE(sa.region, 'Unknown'), f.dealstagekey;
+            d.Year, d.Month, COALESCE(sa.Region, 'Unknown') AS Region, f.DealStageKey,
+            COUNT(*) AS TotalDealCount, SUM(f.CloseValue) AS TotalCloseValue,
+            AVG(f.CloseValue) AS AvgDealValue, AVG(f.DurationDays) AS AvgDurationDays,
+            AVG(f.ExpectedSuccessRate) AS ExpectedSuccessRate
+        FROM FactSalesPerformance f
+        JOIN DimDate d ON f.DateKey = d.DateKey
+        JOIN DimSalesAgent sa ON f.SalesAgentKey = sa.SalesAgentID
+        GROUP BY d.Year, d.Month, COALESCE(sa.Region, 'Unknown'), f.DealStageKey;
         """
         try:
             hook_olap.run(sql_aggregate)
