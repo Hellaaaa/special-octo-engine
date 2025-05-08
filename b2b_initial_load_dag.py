@@ -129,7 +129,7 @@ def b2b_initial_load_dag():
     @task
     def load_dim_date():
         hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID); hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-        sql_get_range = "SELECT MIN(engage_date), MAX(COALESCE(close_date, engage_date)) FROM opportunities;"
+        sql_get_range = "SELECT MIN(EngageDate), MAX(COALESCE(CloseDate, EngageDate)) FROM SalesPipeline;"
         logging.info("Querying OLTP for date range..."); result = hook_oltp.get_first(sql_get_range)
         min_date_str = DEFAULT_MIN_DATE; max_date_str = DEFAULT_MAX_DATE
         try:
@@ -142,14 +142,13 @@ def b2b_initial_load_dag():
     @task
     def load_dim_deal_stage():
         hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID); hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
-        stages = hook_oltp.get_records("SELECT stage_id, name FROM deal_stages")
+        stages = hook_oltp.get_records("SELECT DealStageID, StageName FROM DealStages")
         if stages:
             unique_stages = {sid: name for sid, name in stages}; stages_to_load = list(unique_stages.items())
             try:
                 with hook_olap.get_conn() as conn:
                     with conn.cursor() as cur:
-                        for sid, name in stages_to_load:
-                            cur.execute(f"""INSERT INTO {OLAP_SCHEMA}.dimdealstage (stageid, stagename) VALUES (%s, %s) ON CONFLICT (stageid) DO UPDATE SET stagename = EXCLUDED.stagename;""", (sid, name))
+                        for sid, name in stages_to_load: cur.execute(f"""INSERT INTO {OLAP_SCHEMA}.dimdealstage (stageid, stagename) VALUES (%s, %s) ON CONFLICT (stageid) DO UPDATE SET stagename = EXCLUDED.stagename;""", (sid, name))
                     conn.commit()
                 logging.info(f"Upserted {len(stages_to_load)} rows into dimdealstage.")
             except Exception as e: logging.error(f"Failed to load dimdealstage: {e}"); raise
@@ -159,14 +158,7 @@ def b2b_initial_load_dag():
         variable_name = "initial_load_dim_account_offset"; batch_size = DEFAULT_BATCH_SIZE; total_rows_processed = 0
         while True:
             current_offset = get_batch_state(variable_name, 0); hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
-            sql_extract = """SELECT p.project_id, p.name, s.name AS sector, 
-                CASE WHEN p.revenue < 1000000 THEN 'Under 1M' 
-                     WHEN p.revenue BETWEEN 1000000 AND 10000000 THEN '1M-10M' 
-                     WHEN p.revenue > 10000000 THEN 'Over 10M' ELSE 'Unknown' END AS revenuerange,
-                p.parent_project_id 
-              FROM projects p 
-              LEFT JOIN sectors s ON p.sector_id = s.sector_id 
-              ORDER BY p.project_id LIMIT %s OFFSET %s;"""
+            sql_extract = """SELECT a.AccountID, a.AccountName, s.SectorName, CASE WHEN a.Revenue < 1000000 THEN 'Under 1M' WHEN a.Revenue BETWEEN 1000000 AND 10000000 THEN '1M-10M' WHEN a.Revenue > 10000000 THEN 'Over 10M' ELSE 'Unknown' END, a.ParentAccountID FROM Accounts a LEFT JOIN Sectors s ON a.SectorID = s.SectorID ORDER BY a.AccountID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
             olap_data = [(row[0], row[1], row[2], row[3], row[4]) for row in source_data]
@@ -186,13 +178,7 @@ def b2b_initial_load_dag():
         initial_valid_from = DEFAULT_SCD2_VALID_FROM; logging.info(f"Initial load dimproduct (SCD2), ValidFrom={initial_valid_from}")
         while True:
             current_offset = get_batch_state(variable_name, 0); hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
-            sql_extract = """SELECT p.product_id, p.name, ps.name AS seriesname, p.sales_price,
-                CASE WHEN p.sales_price < 100 THEN 'Low' 
-                     WHEN p.sales_price BETWEEN 100 AND 1000 THEN 'Medium' 
-                     WHEN p.sales_price > 1000 THEN 'High' ELSE 'Unknown' END AS pricerange
-              FROM products p 
-              LEFT JOIN product_series ps ON p.series_id = ps.series_id 
-              ORDER BY p.product_id LIMIT %s OFFSET %s;"""
+            sql_extract = """SELECT p.ProductID, p.ProductName, ps.SeriesName, p.SalesPrice, CASE WHEN p.SalesPrice < 100 THEN 'Low' WHEN p.SalesPrice BETWEEN 100 AND 1000 THEN 'Medium' WHEN p.SalesPrice > 1000 THEN 'High' ELSE 'Unknown' END FROM Products p LEFT JOIN ProductSeries ps ON p.SeriesID = ps.SeriesID ORDER BY p.ProductID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
             olap_data = [(row[0], row[1], row[2], row[3], row[4], initial_valid_from, None, True) for row in source_data]; target_fields = ["productid", "productname", "seriesname", "price", "pricerange", "validfrom", "validto", "iscurrent"]
@@ -206,11 +192,7 @@ def b2b_initial_load_dag():
         variable_name = "initial_load_dim_sales_agent_offset"; batch_size = DEFAULT_BATCH_SIZE; total_rows_processed = 0
         while True:
             current_offset = get_batch_state(variable_name, 0); hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID)
-            sql_extract = """SELECT sa.agent_id, sa.name AS salesagentname, sm.name AS managername, l.name AS region
-                FROM sales_agents sa 
-                LEFT JOIN sales_managers sm ON sa.manager_id = sm.manager_id 
-                LEFT JOIN locations l ON sa.regional_office = l.location_id 
-                ORDER BY sa.agent_id LIMIT %s OFFSET %s;"""
+            sql_extract = """SELECT sa.SalesAgentID, sa.SalesAgentName, sm.ManagerName, l.LocationName AS Region FROM SalesAgents sa LEFT JOIN SalesManagers sm ON sa.ManagerID = sm.ManagerID LEFT JOIN Locations l ON sa.RegionalOfficeID = l.LocationID ORDER BY sa.SalesAgentID LIMIT %s OFFSET %s;"""
             source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             if not source_data: break
             olap_data = [(row[0], row[1], row[2], row[3]) for row in source_data]
@@ -233,16 +215,7 @@ def b2b_initial_load_dag():
         hook_oltp = PostgresHook(postgres_conn_id=OLTP_CONN_ID); hook_olap = PostgresHook(postgres_conn_id=OLAP_CONN_ID)
         while True:
             current_offset = get_batch_state(variable_name, 0)
-            sql_extract = """SELECT sp.opportunity_id, sp.agent_id, sp.product_id, sp.project_id, sp.stage_id,
-                sp.engage_date, sp.close_date, sp.close_value,
-                CASE WHEN sp.close_date IS NOT NULL AND sp.engage_date IS NOT NULL THEN sp.close_date - sp.engage_date ELSE NULL END AS durationdays,
-                CASE ds.name WHEN 'Won' THEN 100.0 WHEN 'Lost' THEN 0.0 WHEN 'Engaging' THEN 75.0 WHEN 'Prospecting' THEN 25.0 ELSE 10.0 END AS expectedsuccessrate,
-                COALESCE(sp.close_date, sp.engage_date) AS event_date
-              FROM opportunities sp 
-              LEFT JOIN deal_stages ds ON sp.stage_id = ds.stage_id
-              WHERE sp.project_id IS NOT NULL AND sp.product_id IS NOT NULL AND sp.agent_id IS NOT NULL 
-                AND sp.stage_id IS NOT NULL AND COALESCE(sp.close_date, sp.engage_date) IS NOT NULL
-              ORDER BY sp.opportunity_id LIMIT %s OFFSET %s;"""
+            sql_extract = """SELECT sp.OpportunityID, sp.SalesAgentID, sp.ProductID, sp.AccountID, sp.DealStageID, sp.EngageDate, sp.CloseDate, sp.CloseValue, CASE WHEN sp.CloseDate IS NOT NULL AND sp.EngageDate IS NOT NULL THEN CAST(sp.CloseDate AS DATE) - CAST(sp.EngageDate AS DATE) ELSE NULL END, CASE ds.StageName WHEN 'Won' THEN 100.0 WHEN 'Lost' THEN 0.0 WHEN 'Engaging' THEN 75.0 WHEN 'Prospecting' THEN 25.0 ELSE 10.0 END, COALESCE(sp.CloseDate, sp.EngageDate) as EventDate FROM SalesPipeline sp LEFT JOIN DealStages ds ON sp.DealStageID = ds.DealStageID WHERE sp.AccountID IS NOT NULL AND sp.ProductID IS NOT NULL AND sp.SalesAgentID IS NOT NULL AND sp.DealStageID IS NOT NULL AND COALESCE(sp.CloseDate, sp.EngageDate) IS NOT NULL ORDER BY sp.OpportunityID LIMIT %s OFFSET %s;"""
             try: source_data = hook_oltp.get_records(sql_extract, parameters=(batch_size, current_offset))
             except Exception as e: logging.error(f"Failed fetch SalesPipeline offset {current_offset}: {e}"); raise AirflowSkipException() from e
             if not source_data: break
@@ -292,7 +265,7 @@ def b2b_initial_load_dag():
     @task
     def reset_incremental_watermarks():
         """Resets timestamp watermarks used by the incremental DAG to the default start time."""
-        incremental_tables = ['projects', 'products', 'sales_agents', 'opportunities']
+        incremental_tables = ['accounts', 'products', 'salesagents', 'salespipeline']
         logging.info("Resetting timestamp watermarks..."); [Variable.set(f"{WATERMARK_VAR_PREFIX}{t}", DEFAULT_START_TIME) for t in incremental_tables]; logging.info("Watermarks reset.")
 
     # --- Instantiate Tasks & Define Flow ---
