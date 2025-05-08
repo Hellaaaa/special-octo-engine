@@ -17,7 +17,7 @@ from airflow.models.baseoperator import cross_downstream
 from airflow.operators.empty import EmptyOperator
 
 # --- Configuration ---
-OLTP_CONN_ID = "crm_system" # Connection ID for your source OLTP database
+OLTP_CONN_ID = "b2b_sales" # Connection ID for your source OLTP database
 OLAP_CONN_ID = "b2b_sales_olap" # Connection ID for your target OLAP database
 OLAP_SCHEMA = "public" # Explicitly define the schema for OLAP tables
 DEFAULT_BATCH_SIZE = 1000 # Number of rows to process in each batch for large tables
